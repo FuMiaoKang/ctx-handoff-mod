@@ -1,0 +1,1 @@
+{ "name": "ctx-handoff", "version": "0.1.0", "description": "Auto handoff + /clear at a context threshold; keep the prompt cache warm while idle, then save an away handoff" }
