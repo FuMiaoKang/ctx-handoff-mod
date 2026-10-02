@@ -24,7 +24,9 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
   })
   on('turn.complete', () => ({ text: '' }))
   on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', type: 'general-purpose' })) }))
-  on('tool.call', () => ({ result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg123456' } }))
+  on('tool.call', (_$, e: { tool: string }) => e.tool === 'Workflow'
+    ? { result: {}, text: 'Workflow started in the background. Task ID: wf_abc123' }
+    : { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg123456' } })
   on('prompt.submit', (_$, e: { text?: string }) => {
     submits.push(e.text ?? '')
     return { text: e.text ?? '' }
@@ -125,4 +127,16 @@ test('子代理還在跑：延後 handoff', async ($, on) => {
   await endTurn($)
   await w.clock.advance(0)
   expect(w.commands).toEqual([])
+})
+
+test('背景 Workflow：從輸出抓到 task id，延後到通知再做', async ($, on) => {
+  const w = world(on, 650_000)
+  await $.tool.call({ tool: 'Workflow', script: 'export const meta = {}' })
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.commands).toEqual([])
+  await $.prompt.submit({ text: '<task-notification> wf_abc123 completed', origin: { kind: 'task-notification' }, wait: false })
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.commands).toEqual(['clear'])
 })

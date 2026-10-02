@@ -18,7 +18,7 @@ All three paths apply to the main conversation only. Subagent turns are ignored.
 
 Evidence so far:
 - The building blocks were checked live with a probe mod. `/clear` followed by `prompt.submit` works from a mod. A fork over a 102k-token conversation read 102,003 of 102,523 input tokens from cache (about 99.5%).
-- `claude plugin test`: 8/8 pass, covering the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, deferral for a background shell, and deferral for a running subagent.
+- `claude plugin test`: 9/9 pass, covering the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, and deferral for a background shell, a background workflow and a running subagent.
 - Not yet observed: a full real session reaching 600k, and whether an idle refresh actually keeps a 1-hour cache alive. See [Limitations](#limitations).
 
 ## Quick start

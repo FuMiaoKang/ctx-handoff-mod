@@ -18,7 +18,7 @@
 
 目前的證據：
 - 用 probe mod 實際驗證過幾個基本元件：mod 可以執行 `/clear` 後接著 `prompt.submit`；對 102k token 的對話做 fork 時，102,523 個輸入 token 中有 102,003 個是從快取讀取（約 99.5%）。
-- `claude plugin test`：8/8 通過。涵蓋門檻觸發、200k 視窗、刷新後存離席 handoff、關閉刷新、context 太小時略過、resume，以及背景 shell 和子代理還在跑時延後。
+- `claude plugin test`：9/9 通過。涵蓋門檻觸發、200k 視窗、刷新後存離席 handoff、關閉刷新、context 太小時略過、resume，以及背景 shell、背景 workflow 和子代理還在跑時延後。
 - 還沒實際觀察到的：在真實 session 中一路跑到 600k 的完整流程，以及閒置刷新是否真的能讓 1 小時快取延續。見[限制](#限制)。
 
 ## 快速開始

@@ -31,7 +31,7 @@ let busy = false
 // 背景 shell／workflow／monitor：id → 開始時間（子代理另由 $.agent.list() 查）
 const background = new Map<string, number>()
 const STALE_MS = 12 * 60 * 60_000
-const BG_ID = /(?:task[ _-]?id|ID)["'s:=]+([A-Za-z0-9_-]{6,})/i
+const BG_ID = /\b(?:task[ _-]?id|ID)\b["'\s:=]+([A-Za-z0-9_-]{6,})/i
 
 async function runningWork($: EngineInterface) {
   const now = await $.clock.now()
