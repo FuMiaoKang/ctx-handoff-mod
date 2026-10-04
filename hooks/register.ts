@@ -11,6 +11,11 @@ const MAX_REFRESH = 3
 // 太小的 context 重建很便宜，不值得刷新或產生離席 handoff
 const MIN_TOKENS = 30_000
 const KEEP = 5
+// fork 沒有取消參數：超過時限就不再等（交接放棄、攔下的訊息送回舊對話），它在背景跑完也不採用
+const HANDOFF_TIMEOUT_MS = 3 * 60_000
+const DISTILL_TIMEOUT_MS = 8 * 60_000
+// 交接前整理和 handoff 同時發出；從交接開始最多等這麼久就 /clear，整理留在背景跑完
+const DISTILL_GRACE_MS = 60_000
 
 const HANDOFF_PROMPT = [
   '為接手這段工作的新對話寫一份 handoff，第一行寫「HANDOFF:」加一句話的目標，全文不超過 1500 字。',
@@ -57,6 +62,7 @@ function distillPrompt(anchor: string | undefined, projects: { path: string; not
     '這個對話涉及的專案：',
     ...projects.map(({ path }, p) => `P${p + 1} ${path}${p === 0 ? '（預設：session 啟動資料夾）' : ''}`),
     '每條都要判斷屬於哪個專案：只屬於某個 repo 的經驗放到那個專案，跨專案通用或不確定的放 P1。',
+    '現有條目放錯專案時，用 move_memory／move_rule 整條搬過去，不要用 delete 再 add（其中一行失效就會遺失）。',
     ...sections,
     '',
     '一、記憶：之後的工作值得記住、已經被證實的事。',
@@ -79,8 +85,11 @@ function distillPrompt(anchor: string | undefined, projects: { path: string; not
     '{"op":"confirm_rule","id":"P1-R2","evidence":"…"}',
     '{"op":"update_rule","id":"P1-R2","rule":"…"}',
     '{"op":"delete_rule","id":"P1-R4","reason":"…"}',
+    '{"op":"move_memory","id":"P1-M5","project":"P2"}',
+    '{"op":"move_rule","id":"P1-R6","project":"P2"}',
     ACTIONS_END,
-    'type 只能是 user、feedback、project、reference；add_memory 與 add_rule 省略 project 就是 P1；update／delete／confirm 的專案由 id 前綴決定。',
+    'type 只能是 user、feedback、project、reference；add_memory 與 add_rule 省略 project 就是 P1；update／delete／confirm 的專案由 id 前綴決定；move 的 project 是目的地。',
+    '每行必須是合法 JSON：字串裡的雙引號寫成 \\"，不要換行。',
   ].join('\n')
 }
 
@@ -165,81 +174,116 @@ type Action =
   | { op: 'confirm_rule'; p: number; i: number; evidence: string }
   | { op: 'update_rule'; p: number; i: number; rule: string }
   | { op: 'delete_rule'; p: number; i: number }
+  | { op: 'move_memory'; p: number; i: number; to: number }
+  | { op: 'move_rule'; p: number; i: number; to: number }
 
 // 非空字串：換行與連續空白收成一個空格，避免一個欄位寫出多行、破壞 md 結構
 const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.replace(/\s+/g, ' ').trim() : undefined)
 
-// 一行 JSON 轉成動作；op 不認得、欄位缺漏、類型不對、專案或編號不存在都回 undefined
-function toAction(o: Record<string, unknown>, notes: Notes[]): Action | undefined {
+// 一行 JSON 轉成動作；無效時回傳原因（記進丟棄樣本，事後查得出是哪一種）
+function toAction(o: Record<string, unknown>, notes: Notes[]): Action | string {
   const ref = (kind: 'M' | 'R') => {
     const m = typeof o.id === 'string' ? /^P(\d+)-([MR])(\d+)$/.exec(o.id) : null
-    if (!m || m[2] !== kind) return undefined
+    if (!m || m[2] !== kind) return `id 不是 P<n>-${kind}#`
     const p = Number(m[1]) - 1
     const i = Number(m[3]) - 1
     const len = kind === 'M' ? notes[p]?.memory.length : notes[p]?.rules.length
-    return len !== undefined && i >= 0 && i < len ? { p, i } : undefined
+    if (len === undefined) return `沒有專案 P${p + 1}`
+    return i >= 0 && i < len ? { p, i } : `沒有編號 ${o.id}`
   }
-  const project = () => {
-    if (o.project === undefined) return 0
+  const project = (fallback: number | undefined) => {
+    if (o.project === undefined) return fallback ?? '缺少 project'
     const m = typeof o.project === 'string' ? /^P(\d+)$/.exec(o.project) : null
     const p = m ? Number(m[1]) - 1 : -1
-    return p >= 0 && p < notes.length ? p : undefined
+    return p >= 0 && p < notes.length ? p : `沒有專案 ${String(o.project)}`
   }
   const type = typeof o.type === 'string' && MEMORY_TYPES.includes(o.type) ? o.type : undefined
+  const needType = () => (type ? undefined : `type 無效（${String(o.type)}）`)
+  const missing = (fields: Record<string, string | undefined>) => {
+    const names = Object.entries(fields).filter(([, v]) => !v).map(([k]) => k)
+    return names.length ? `缺少 ${names.join('、')}` : undefined
+  }
   switch (o.op) {
     case 'add_memory': {
-      const p = project()
+      const p = project(0)
       const text = str(o.text)
-      return p !== undefined && type && text ? { op: 'add_memory', p, type, text } : undefined
+      if (typeof p === 'string') return p
+      return needType() ?? missing({ text }) ?? { op: 'add_memory', p, type: type!, text: text! }
     }
     case 'update_memory': {
       const r = ref('M')
       const text = str(o.text)
-      return r && type && text ? { op: 'update_memory', ...r, type, text } : undefined
+      if (typeof r === 'string') return r
+      return needType() ?? missing({ text }) ?? { op: 'update_memory', ...r, type: type!, text: text! }
     }
     case 'delete_memory': {
       const r = ref('M')
-      return r && str(o.reason) ? { op: 'delete_memory', ...r } : undefined
+      if (typeof r === 'string') return r
+      return missing({ reason: str(o.reason) }) ?? { op: 'delete_memory', ...r }
     }
     case 'add_rule': {
-      const p = project()
+      const p = project(0)
+      if (typeof p === 'string') return p
       const name = str(o.name)?.replace(/（\d+ 次）$/, '').trim()
       const [rule, applies, notApplies, evidence] = [o.rule, o.applies, o.not_applies, o.evidence].map(str)
-      return p !== undefined && name && rule && applies && notApplies && evidence
-        ? { op: 'add_rule', p, name, rule, applies, notApplies, evidence }
-        : undefined
+      return missing({ name, rule, applies, not_applies: notApplies, evidence })
+        ?? { op: 'add_rule', p, name: name!, rule: rule!, applies: applies!, notApplies: notApplies!, evidence: evidence! }
     }
     case 'confirm_rule': {
       const r = ref('R')
+      if (typeof r === 'string') return r
       const evidence = str(o.evidence)
-      return r && evidence ? { op: 'confirm_rule', ...r, evidence } : undefined
+      return missing({ evidence }) ?? { op: 'confirm_rule', ...r, evidence: evidence! }
     }
     case 'update_rule': {
       const r = ref('R')
+      if (typeof r === 'string') return r
       const rule = str(o.rule)
-      return r && rule ? { op: 'update_rule', ...r, rule } : undefined
+      return missing({ rule }) ?? { op: 'update_rule', ...r, rule: rule! }
     }
     case 'delete_rule': {
       const r = ref('R')
-      return r && str(o.reason) ? { op: 'delete_rule', ...r } : undefined
+      if (typeof r === 'string') return r
+      return missing({ reason: str(o.reason) }) ?? { op: 'delete_rule', ...r }
+    }
+    case 'move_memory':
+    case 'move_rule': {
+      const r = ref(o.op === 'move_memory' ? 'M' : 'R')
+      if (typeof r === 'string') return r
+      const to = project(undefined)
+      if (typeof to === 'string') return to
+      if (to === r.p) return '搬到同一個專案'
+      return { op: o.op, ...r, to }
     }
     default:
-      return undefined
+      return `不認得的 op（${String(o.op)}）`
   }
 }
 
-// 只解析兩個標記之間的行，一行一個 JSON；無效的行丟棄並記數與最多 3 個截短的樣本。
+// 任何一層的字串值疑似金鑰（值是解析後的，跳脫寫法也看得到）
+const hasSecret = (v: unknown): boolean =>
+  typeof v === 'string' ? SECRETISH.test(v)
+    : Array.isArray(v) ? v.some(hasSecret)
+      : v !== null && typeof v === 'object' ? Object.values(v).some(hasSecret)
+        : false
+
+// 丟棄樣本：原因＋行的頭尾（JSON 壞掉的地方常在後段）
+const sampleOf = (why: string, line: string) =>
+  `${why}：${line.length > 160 ? `${line.slice(0, 100)}…${line.slice(-50)}` : line}`
+
+// 只解析兩個標記之間的行，一行一個 JSON；無效的行丟棄並記數與最多 3 個樣本（含原因）。
 // 疑似金鑰的行整行丟棄，樣本不記內容（樣本會寫進 store）
 function parseActions(text: string, notes: Notes[]): { actions: Action[]; rejected: Rejected } {
   const actions: Action[] = []
   const rejected: Rejected = { count: 0, samples: [] }
-  const reject = (sample: string) => {
+  // secret：解析後的值疑似金鑰。值可能是跳脫寫法（\u0073k-…），原始行比對不到，所以不能只靠再比對一次
+  const reject = (why: string, line = '', secret = false) => {
     rejected.count += 1
-    if (rejected.samples.length < 3) rejected.samples.push(SECRETISH.test(sample) ? '（疑似金鑰，內容不記錄）' : sample.slice(0, 120))
+    if (rejected.samples.length < 3) rejected.samples.push(secret || SECRETISH.test(line) ? `${why}：（內容不記錄）` : sampleOf(why, line))
   }
   const start = text.indexOf(ACTIONS_START)
   if (start === -1) {
-    if (text.trim()) reject(`（找不到 ${ACTIONS_START} 標記）`)
+    if (text.trim()) reject(`找不到 ${ACTIONS_START} 標記`)
     return { actions, rejected }
   }
   let body = text.slice(start + ACTIONS_START.length)
@@ -249,19 +293,21 @@ function parseActions(text: string, notes: Notes[]): { actions: Action[]; reject
     // 空行與模型順手包上的程式碼圍欄不算無效輸出
     if (!line || line.startsWith('```')) continue
     let o: unknown
-    try { o = JSON.parse(line) } catch { reject(line); continue }
-    if (!o || typeof o !== 'object' || Array.isArray(o)) { reject(line); continue }
+    try { o = JSON.parse(line) } catch (err) { reject(`JSON 格式錯誤（${(err instanceof Error ? err.message : String(err)).slice(0, 60)}）`, line); continue }
+    if (!o || typeof o !== 'object' || Array.isArray(o)) { reject('不是 JSON 物件', line); continue }
     const rec = o as Record<string, unknown>
-    if (Object.values(rec).some(v => typeof v === 'string' && SECRETISH.test(v))) { reject('（疑似金鑰，內容不記錄）'); continue }
+    if (hasSecret(rec)) { reject('疑似金鑰', '', true); continue }
     const a = toAction(rec, notes)
-    if (a) actions.push(a)
-    else reject(line)
+    if (typeof a === 'string') reject(a, line)
+    else actions.push(a)
   }
   return { actions, rejected }
 }
 
 // 依序套用已驗證的動作，結果依專案分開；語意和舊的逐行格式相同
-function applyActions(actions: Action[], all: Notes[], day: string): { notes: Notes; changes: Change[] }[] {
+// incoming：每個專案這次收到的搬入條目（搬移當下的內容），給兩階段寫入的第一階段用
+type Applied = { notes: Notes; changes: Change[]; incoming: { memory: string[]; rules: Rule[] } }
+function applyActions(actions: Action[], all: Notes[], day: string): Applied[] {
   const field = (label: string, value: string) => `- ${label}：${value}`
   const st = all.map(n => ({
     memory: [...n.memory] as (string | undefined)[],
@@ -269,6 +315,8 @@ function applyActions(actions: Action[], all: Notes[], day: string): { notes: No
     rules: n.rules.map(r => ({ ...r, body: [...r.body] })) as (Rule | undefined)[],
     added: [] as Rule[],
     changes: [] as Change[],
+    incomingMem: [] as string[],
+    incomingRules: [] as Rule[],
   }))
   for (const a of actions) {
     const s = st[a.p]
@@ -321,11 +369,37 @@ function applyActions(actions: Action[], all: Notes[], day: string): { notes: No
         if (r) { s.changes.push(`刪除規則：${r.name}`); s.rules[a.i] = undefined }
         break
       }
+      // 搬移：整條（含延續行、根據）原樣移過去，兩邊在同一次寫入裡成立
+      case 'move_memory': {
+        const m = s.memory[a.i]
+        const t = st[a.to]
+        if (m === undefined || !t) break
+        if (!t.memory.includes(m) && !t.addedMem.includes(m)) t.addedMem.push(m)
+        t.incomingMem.push(m)
+        s.memory[a.i] = undefined
+        s.changes.push(`搬出記憶（到 P${a.to + 1}）：${m.replace(/^- /, '')}`)
+        t.changes.push(`搬入記憶：${m.replace(/^- /, '')}`)
+        break
+      }
+      case 'move_rule': {
+        const r = s.rules[a.i]
+        const t = st[a.to]
+        if (!r || !t) break
+        // 目的地已有同名規則：次數併入，不重複新增
+        const same = [...t.rules, ...t.added].find(x => x?.name === r.name)
+        t.incomingRules.push({ ...r, body: [...r.body] })
+        if (same) same.count += r.count
+        else t.added.push({ ...r, body: [...r.body] })
+        s.rules[a.i] = undefined
+        s.changes.push(`搬出規則（到 P${a.to + 1}）：${r.name}`)
+        t.changes.push(same ? `搬入規則（併入同名，出現 ${same.count} 次）：${r.name}` : `搬入規則：${r.name}`)
+        break
+      }
     }
   }
   return all.map((n, i) => {
     const s = st[i]
-    if (!s) return { notes: n, changes: [] }
+    if (!s) return { notes: n, changes: [], incoming: { memory: [], rules: [] } }
     return {
       notes: {
         memory: [...s.memory.filter((m): m is string => m !== undefined), ...s.addedMem],
@@ -333,6 +407,7 @@ function applyActions(actions: Action[], all: Notes[], day: string): { notes: No
         extra: n.extra,
       },
       changes: s.changes,
+      incoming: { memory: s.incomingMem, rules: s.incomingRules },
     }
   })
 }
@@ -386,6 +461,8 @@ let busy = false
 // 在場交接進行中（門檻或 /handoff now）：使用者訊息先攔下，交接後一併送出
 let presenting = false
 let held: string[] = []
+// 這次在場交接開始的時間（undefined＝還沒開始計時），給攔訊息的提示與等整理的上限用
+let presentStartedAt: number | undefined
 // 背景整理的差異：依 session id 暫存，跟著下一則真正送進對話的訊息帶入
 const pendingNotes = new Map<string, { changes: Change[]; files: string[] }>()
 // 這個 process 送出失敗、尚未送達的 handoff（舊 session id）
@@ -406,10 +483,27 @@ async function isRefreshOn($: EngineInterface) {
 
 // fork 失敗的原因；nothing-to-fork 多半是剛重新啟動（含自動更新）或剛 /clear，主對話回應一次就能用
 function forkFailure(reason: string) {
+  if (reason === 'timeout') return 'timeout：fork 超過時限沒有回應，已放棄等待'
   return reason === 'nothing-to-fork'
     ? 'nothing-to-fork：這個 session 剛重新啟動或剛 /clear，還沒有可以接的請求；先送一則訊息，等它回應後再執行一次'
     : reason
 }
+
+// 最多等 ms：逾時回 fallback（原本的 promise 照樣跑完，只是不再等它）
+async function within<T, F>($: EngineInterface, p: Promise<T>, ms: number, fallback: F): Promise<T | F> {
+  let timer: Timer | undefined
+  const late = new Promise<F>(resolve => { timer = $.clock.after(ms, () => resolve(fallback)) })
+  try {
+    return await Promise.race([p, late])
+  } finally {
+    timer?.cancel()
+  }
+}
+
+type ForkResult = Awaited<ReturnType<EngineInterface['model']['fork']>>
+type ForkOutcome = ForkResult | { isAnswered: false; reason: 'timeout' }
+const forkWithin = ($: EngineInterface, prompt: string, ms: number): Promise<ForkOutcome> =>
+  within($, $.model.fork({ prompt }), ms, { isAnswered: false as const, reason: 'timeout' as const })
 
 // 專案鍵：專案目錄的名稱（<claude>/projects/<這一層>/memory/ctx-handoff.md）
 async function projectKey($: EngineInterface) {
@@ -436,7 +530,7 @@ async function recordFailure($: EngineInterface, kind: Kind, tokens: number | nu
 
 async function makeHandoff($: EngineInterface, kind: Kind, tokens: number | null) {
   const started = await $.clock.now()
-  const r = await $.model.fork({ prompt: HANDOFF_PROMPT })
+  const r = await forkWithin($, HANDOFF_PROMPT, HANDOFF_TIMEOUT_MS)
   if (!r.isAnswered) {
     $.ui.log(`${tag} handoff 產生失敗：${forkFailure(r.reason)}`)
     $.ui.toast(`${tag} handoff 產生失敗`)
@@ -509,13 +603,29 @@ async function claudeDir($: EngineInterface) {
   return `${slash(home)}/.claude`
 }
 
+// 本 session 的專案位置候選：啟動資料夾所屬 repo 的根目錄、啟動資料夾本身。
+// 不用 $.session.repo()：它依目前工作目錄判斷，會跟著 Bash 的 cd 變，P1 與 store 的專案鍵就會跑掉
+async function sessionRoots($: EngineInterface) {
+  const root = slash(await $.session.root())
+  const repo = await gitRootOf($, root)
+  const main = repo === undefined ? undefined : await mainWorktree($, repo)
+  return [...new Set([main, repo, root].filter((p): p is string => !!p))]
+}
+
+// worktree 的 .git 是檔案（gitdir: <主工作樹>/.git/worktrees/<名稱>）：回主工作樹；否則原樣
+async function mainWorktree($: EngineInterface, repo: string) {
+  const m = /^gitdir:\s*(.+?)\/\.git\/worktrees\/[^/]+\s*$/m.exec(slash(await readText($, `${repo}/.git`)))
+  if (!m?.[1]) return repo
+  const main = slash(m[1])
+  return isAbs(main) ? main : resolveDots(`${repo}/${main}`)
+}
+
 // 專案記憶在 <claude>/projects/<編碼後的專案路徑>/memory；以本 session 的對話檔所在位置確認
 async function projectDir($: EngineInterface) {
   const sid = await $.session.id()
   if (projectDirCache?.sid === sid) return projectDirCache.dir
   const base = `${await claudeDir($)}/projects`
-  const repo = await $.session.repo()
-  const roots = [repo?.root, await $.session.root()].filter((p): p is string => !!p)
+  const roots = await sessionRoots($)
   for (const p of roots) {
     const dir = `${base}/${encodeProject(p)}`
     if (await $.fs.exists(`${dir}/${sid}.jsonl`)) return (projectDirCache = { sid, dir }).dir
@@ -539,8 +649,7 @@ async function readText($: EngineInterface, path: string) {
 // 不寫 MEMORY.md：那是內建 auto memory 的索引，開啟 auto memory 時會被載入兩次、也會被它改寫
 async function notesFile($: EngineInterface, existingOnly = false) {
   const base = `${await claudeDir($)}/projects`
-  const repo = await $.session.repo()
-  const roots = [repo?.root, await $.session.root()].filter((p): p is string => !!p)
+  const roots = await sessionRoots($)
   // 先查掃描時記下的對照（編碼後的路徑和實際目錄不同的專案）
   for (const p of roots) {
     const mapped = await $.store.get(`projdir:${encodeProject(p)}`)
@@ -739,23 +848,50 @@ async function distill($: EngineInterface, why: string, queue = true) {
     // 這次整理到使用者最後一則訊息為止；下次從它之後開始
     const anchor = (await $.store.get(`last:${sid}`)) as string | undefined
     const started = await $.clock.now()
-    const r = await $.model.fork({ prompt: distillPrompt(prev?.anchor, projects) })
+    const r = await forkWithin($, distillPrompt(prev?.anchor, projects), DISTILL_TIMEOUT_MS)
     if (!r.isAnswered) { await fail(forkFailure(r.reason)); return r }
     const now = await $.clock.now()
     const stamp = localStamp(now)
     const { actions, rejected } = parseActions(r.text, projects.map(p => p.notes))
-    const results = applyActions(actions, projects.map(p => p.notes), stamp.slice(0, 10))
+    // 每個專案各自檢查：fork 期間那份檔案被改過，編號對不上，只略過它；其他照寫。
+    // 先決定略過哪些再套用：搬移的任一端被略過，整筆搬移都不做，避免一邊刪了、另一邊沒寫進去
+    const skippedIdx = new Set<number>()
+    for (const [i, p] of projects.entries()) {
+      if ((await readText($, p.file)) !== p.original) skippedIdx.add(i)
+    }
+    const usable = actions.filter(a => !skippedIdx.has(a.p) && !('to' in a && skippedIdx.has(a.to)))
+    const results = applyActions(usable, projects.map(p => p.notes), stamp.slice(0, 10))
     const changes: Change[] = []
     const files: string[] = []
     const skipped: string[] = []
-    // 每個專案各自檢查：fork 期間那份檔案被改過，編號對不上，只略過它；其他照寫
+    // 搬移的兩階段寫入：先讓每個目的地都有了被搬的條目（來源也還留著），再寫最終版本。
+    // 中途寫檔失敗頂多暫時重複一條，不會兩邊都沒有
+    const receives = new Set(usable.flatMap(a => ('to' in a ? [a.to] : [])))
+    const stagedIdx = new Set<number>()
+    // 第一階段只「加」：目的地原本的內容＋搬進來的條目，不套用任何刪除或修改（同名規則暫時重複也無妨）
+    for (const i of receives) {
+      const p = projects[i]
+      const inc = results[i]?.incoming
+      if (!p || !inc) continue
+      const memory = [...p.notes.memory, ...inc.memory.filter(m => !p.notes.memory.includes(m))]
+      await $.fs.write(p.file, renderNotes({ memory, rules: [...p.notes.rules, ...inc.rules], extra: p.notes.extra }, stamp))
+      stagedIdx.add(i)
+    }
+    const written = new Set<number>()
     for (const [i, p] of projects.entries()) {
+      const touchedHere = actions.some(a => a.p === i || ('to' in a && a.to === i))
+      if (skippedIdx.has(i)) { if (touchedHere) skipped.push(p.file); continue }
       const res = results[i]
-      if (!res || res.changes.length === 0) continue
-      if ((await readText($, p.file)) !== p.original) { skipped.push(p.file); continue }
+      // 第一階段寫過的檔案一律寫回最終版本，即使最終沒有變動（例如同一條被搬兩次，第二次在最終版本裡無效）
+      if (!res || (res.changes.length === 0 && !stagedIdx.has(i))) continue
       await $.fs.write(p.file, renderNotes(res.notes, stamp))
+      if (res.changes.length > 0) written.add(i)
+    }
+    // 變動依專案順序列出
+    for (const [i, p] of projects.entries()) {
+      if (!written.has(i)) continue
       files.push(p.file)
-      changes.push(...res.changes.map(c => (p.label ? `[${p.label}] ${c}` : c)))
+      changes.push(...(results[i]?.changes ?? []).map(c => (p.label ? `[${p.label}] ${c}` : c)))
     }
     if (skipped.length > 0) {
       const reason = `整理期間檔案被修改，這次略過：${skipped.join('、')}`
@@ -768,12 +904,16 @@ async function distill($: EngineInterface, why: string, queue = true) {
     await touchSeen($, key)
     const usage = describeUsage({ input: r.usage.input_tokens, cacheRead: r.usage.cache_read_input_tokens, cacheCreation: r.usage.cache_creation_input_tokens, output: r.usage.output_tokens, ms: now - started })
     await $.store.set(`distill:last:${await projectKey($)}`, { at: now, why, changes, file, usage, rejected } satisfies DistillLast)
-    $.ui.log(`${tag} 背景整理（${why}）：${changes.length} 項變動${rejected.count ? `，丟棄 ${rejected.count} 行無效輸出` : ''}`)
+    $.ui.log(`${tag} 背景整理（${why}）：${changes.length} 項變動${rejected.count ? `，丟棄 ${rejected.count} 行無效輸出` : ''}${files.length ? `；寫入 ${files.join('、')}` : ''}`)
     // 先寫檔再排入；差異跟著下一則真正送進對話的訊息帶入（見 prompt.submit）
     if (changes.length > 0 && queue) {
       const old = pendingNotes.get(sid)
       pendingNotes.set(sid, { changes: [...(old?.changes ?? []), ...changes], files: [...new Set([...(old?.files ?? []), ...files])] })
       $.ui.log(`${tag} ${changes.length} 項變動排入下一則訊息`)
+    }
+    // 讓使用者看得到：寫了哪幾份檔案（完整路徑），不送訊息、不花 token
+    if (changes.length > 0) {
+      $.ui.toast(`${tag} 經驗已更新 ${changes.length} 項${queue ? '，會跟著你下一則訊息帶入' : ''}：${files.join('、')}`)
     }
     return r
   } catch (err) {
@@ -822,7 +962,7 @@ async function onIdle($: EngineInterface) {
   if ((await isRefreshOn($)) && refreshes < MAX_REFRESH) {
     // 刷新本來就要花一次 fork：有新對話就順便整理，沒有才只回 OK
     const r = ((await isDistillOn($)) ? await distill($, '閒置刷新') : undefined)
-      ?? await $.model.fork({ prompt: '只回覆 OK' })
+      ?? await forkWithin($, '只回覆 OK', HANDOFF_TIMEOUT_MS)
     refreshes += 1
     $.ui.log(r.isAnswered
       ? `${tag} 快取刷新 ${refreshes}/${MAX_REFRESH} cache_read=${r.usage.cache_read_input_tokens} cache_creation=${r.usage.cache_creation_input_tokens}`
@@ -851,6 +991,7 @@ function beginPresent() {
   busy = true
   presenting = true
   held = []
+  presentStartedAt = undefined
   idle?.cancel()
   idle = undefined
 }
@@ -858,6 +999,8 @@ function beginPresent() {
 const heldBlock = (items: string[]) => `---\n交接期間收到的使用者訊息：\n${items.join('\n\n')}`
 
 async function present($: EngineInterface, tokens: number | null, kind: 'present' | 'manual', note?: string) {
+  const startedAt = await $.clock.now()
+  presentStartedAt = startedAt
   const sid = await $.session.id()
   // held 已處理到第幾則：之前的已包進送出的文字，或已另外送出
   let delivered = 0
@@ -873,11 +1016,13 @@ async function present($: EngineInterface, tokens: number | null, kind: 'present
   }
   try {
     // 交接 fork 和 /clear 前的最後整理同時發出：快取都熱著
-    const [handoff] = await Promise.all([
-      makeHandoff($, kind, tokens),
-      isDistillOn($).then(on => on ? distill($, '交接前', false) : undefined),
-    ])
+    const lastDistill = isDistillOn($).then(on => on ? distill($, '交接前', false) : undefined).catch(() => undefined)
+    const handoff = await makeHandoff($, kind, tokens)
     if (handoff === undefined) { await drain(resubmit); return }
+    // 整理在大 context 下比 handoff 慢很多（800k 約 3 分鐘）：從交接開始最多等 DISTILL_GRACE_MS，
+    // 之後就 /clear，整理在背景跑完照樣寫檔（它不排入差異）
+    const left = startedAt + DISTILL_GRACE_MS - (await $.clock.now())
+    if (left > 0) await within($, lastDistill, left, undefined)
     const why = kind === 'manual' ? '手動執行 /handoff now' : `context 達 ${tokens} tokens`
     const included = [...held]
     delivered = included.length
@@ -1099,9 +1244,19 @@ export const register: Register = on => {
     if (!isHuman) return next(e)
     const isSlash = e.text.trimStart().startsWith('/')
     // 交接進行中：訊息先攔下，建好的文字或交接後一起送進新對話
-    if (presenting && !isSlash && e.text.trim()) {
+    const hasAttachments = (e.attachments?.length ?? 0) > 0
+    if (presenting && !isSlash && (e.text.trim() || hasAttachments)) {
+      const elapsed = presentStartedAt === undefined ? 0 : Math.round(((await $.clock.now()) - presentStartedAt) / 1000)
+      const wait = `已進行 ${elapsed} 秒，通常 1 分鐘內完成，最長約 ${Math.round(Math.max(HANDOFF_TIMEOUT_MS, DISTILL_GRACE_MS) / 60_000)} 分鐘`
+      // 只能暫存文字：mod 拿不到附件內容
+      const attachNote = hasAttachments ? '圖片等附件無法暫存，交接完成後請重新貼上。' : ''
+      if (!e.text.trim()) return { drop: `${tag} 正在交接（${wait}）。${attachNote}` }
+      // 以為卡住而重送：同樣的內容只送一次
+      if (held.some(h => h.trim() === e.text.trim())) {
+        return { drop: `${tag} 正在交接（${wait}）。這則訊息先前已暫存，不會重複送出。${attachNote}` }
+      }
       held.push(e.text)
-      return { drop: `${tag} 正在交接，這則訊息已暫存，會在新對話一併送出。` }
+      return { drop: `${tag} 正在交接（${wait}），這則訊息已暫存，會在新對話一併送出。${attachNote}` }
     }
     idle?.cancel()
     idle = undefined
@@ -1123,10 +1278,18 @@ export const register: Register = on => {
     let msg = e
     if (away !== undefined) {
       if (away.held === undefined) {
+        // 只有附件、沒有文字：沒有可以暫存的內容，先請使用者選擇
+        if (!e.text.trim()) {
+          return {
+            drop: `${tag} 有一份離席 handoff，舊對話的快取已過期。圖片等附件無法暫存：` +
+              '請先 /handoff resume（開新對話）或 /handoff continue（留在舊對話），再重新貼上。',
+          }
+        }
         await $.store.set(key, { ...away, held: e.text } satisfies Away)
         return {
           drop: `${tag} 有一份離席 handoff，舊對話的快取已過期。` +
-            '/handoff resume：開新對話接續，並帶上這則訊息；/handoff continue：在舊對話送出這則訊息（或直接再送一次）。',
+            '/handoff resume：開新對話接續，並帶上這則訊息；/handoff continue：在舊對話送出這則訊息（或直接再送一次）。' +
+            (hasAttachments ? '只暫存了文字，圖片等附件請在選擇後重新貼上。' : ''),
         }
       }
       // 再送一次＝選擇繼續舊對話；文字不同就把先前攔下的那則一起帶上
@@ -1277,6 +1440,11 @@ ${handoff}`)
         if (!failed) return
         $.ui.log(`${tag} /clear 或送出失敗：${failed.reason}`)
         await recordFailure($, 'away', null, `${failed.stage} 失敗：${failed.reason}`, sid)
+        // 還在舊對話：放回離席 handoff（連同攔下的訊息），可以再 /handoff resume 或 continue
+        if (failed.stage === 'clear') {
+          await $.store.set(key, away)
+          $.ui.toast(`${tag} /clear 失敗，離席 handoff 已保留，可以再 /handoff resume`)
+        }
       })
       .catch(err => $.ui.log(`${tag} /clear 或送出失敗：${String(err)}`))
       .finally(() => { busy = false })
