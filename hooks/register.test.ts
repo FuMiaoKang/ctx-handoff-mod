@@ -1,48 +1,146 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
+import { NOTES_FIXTURE } from './fixtures/notes.fixture'
 
 const usage = (tokens: number) =>
   ({ input_tokens: 1, output_tokens: 1, cache_read_input_tokens: tokens, cache_creation_input_tokens: 0 })
 
-// 引擎底下的世界：用量、fork、/clear、送出，全部記下來
-const world = (on: On, tokens: number, window = 1_000_000, store: Record<string, unknown> = {}, agents: { id: string; status: string }[] = []) => {
+// 背景整理 fork 的回覆；個別測試可以換掉，onFork 可以模擬 fork 期間發生的事
+// 一行一個 JSON 動作；包在 ACTIONS／END 標記之間
+const actionsReply = (...lines: (string | object)[]) =>
+  ['=== ACTIONS ===', ...lines.map(l => (typeof l === 'string' ? l : JSON.stringify(l))), '=== END ==='].join('\n')
+const DISTILL_REPLY = actionsReply(
+  { op: 'add_memory', type: 'project', text: '使用者決定交接門檻維持 600k' },
+  { op: 'add_memory', type: 'project', text: 'api_key=abc123 不該被寫入' },
+  { op: 'add_rule', name: '先實測再下結論', rule: '宣稱現行行為前先跑一次最小實測', applies: 'API 行為不確定時', not_applies: '文件已明確保證時', evidence: 'fork 能否讀寫靠實測才確定' },
+)
+let distillReply = DISTILL_REPLY
+let onFork: (() => void | Promise<void>) | undefined
+// 每個 fork 都會等它：用來讓 fork 停在半空中，測試並行與交接期間的行為
+let forkGate: (() => Promise<void>) | undefined
+// 交接 fork（不是整理）回傳失敗
+let failHandoff = false
+// 接下來幾次 prompt.submit 丟出例外
+let failSubmits = 0
+// /clear 執行時順便做的事（模擬 /clear 與送出之間到的訊息）
+let onClear: (() => void | Promise<void>) | undefined
+// 下層 Stop hook 要求繼續（例如另一個 plugin 擋下停止）
+let stopBlock: string | undefined
+let curSid = 'S1'
+// session 啟動資料夾（P1）與目前工作目錄
+let curRoot = 'C:\\proj'
+let curCwd = 'C:/proj'
+
+// 引擎底下的世界：用量、fork、/clear、送出、檔案，全部記下來
+const world = (on: On, tokens: number, window = 1_000_000, store: Record<string, unknown> = {}, agents: { id: string; status: string }[] = [], turns: number | (() => number) = 0) => {
+  const turnsOf = typeof turns === 'function' ? turns : () => turns
   const forks: string[] = []
   const commands: string[] = []
   const submits: string[] = []
+  const contexts: (readonly string[] | undefined)[] = []
+  const toasts: string[] = []
+  const files = new Map<string, string>([['C:/Users/u/.claude/projects/C--proj/S1.jsonl', '']])
+  const logs: string[] = []
+  distillReply = DISTILL_REPLY
+  onFork = undefined
+  forkGate = undefined
+  failHandoff = false
+  failSubmits = 0
+  onClear = undefined
+  stopBlock = undefined
+  curSid = 'S1'
+  curRoot = 'C:\\proj'
+  curCwd = 'C:/proj'
   const clock = mock.clock(on)
-  mock.store(on, store)
-  on('session.id', () => ({ value: 'S1' }))
+  on('ui.log', (_$, e: unknown) => { logs.push(JSON.stringify(e)); return { value: undefined } })
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', (_$, e: unknown) => { toasts.push(JSON.stringify(e)); return { value: undefined } })
+  // 自己的 store：測試要直接讀寫（$.store 不在測試引擎的 $ 上）；值經過 JSON 來回，和真的一樣
+  const kv = new Map<string, unknown>(Object.entries(store))
+  on('store.get', (_$, e: { key: string }) => ({ value: kv.has(e.key) ? JSON.parse(JSON.stringify(kv.get(e.key))) : undefined }))
+  on('store.set', (_$, e: { key: string; value: unknown }) => { kv.set(e.key, JSON.parse(JSON.stringify(e.value))); return { value: undefined } })
+  on('store.delete', (_$, e: { key: string }) => { kv.delete(e.key); return { value: undefined } })
+  on('store.keys', () => ({ value: [...kv.keys()] }))
+  const get = (key: string) => kv.get(key)
+  const put = (key: string, value: unknown) => { kv.set(key, value) }
+  mock.env(on, { USERPROFILE: 'C:\\Users\\u' })
+  on('session.id', () => ({ value: curSid }))
+  on('session.turns', () => ({ value: turnsOf() }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { tokens, window }, rateLimits: [] } }))
-  on('model.fork', (_$, e: { prompt: string }) => {
-    forks.push(e.prompt)
-    return { value: { isAnswered: true as const, text: 'HANDOFF: 測試', usage: usage(tokens) } }
+  on('session.repo', () => ({ value: null }))
+  on('session.root', () => ({ value: curRoot }))
+  on('session.cwd', () => ({ value: curCwd }))
+  // 工具本身：什麼都不做，只讓 tool.call 能走到本 plugin 的 hook
+  on('tool.call', () => ({ result: 'ok' }))
+  // 引擎會把路徑轉成原生格式（Windows 反斜線），比對前先統一成斜線
+  const norm = (p: string) => p.split(String.fromCharCode(92)).join('/')
+  on('fs.exists', (_$, e: { path: string }) => ({ value: files.has(norm(e.path)) }))
+  on('fs.list', (_$, e: { path: string }) => {
+    const dir = `${norm(e.path).replace(/\/+$/, '')}/`
+    const names = new Map<string, 'file' | 'dir'>()
+    for (const p of files.keys()) {
+      if (!p.startsWith(dir)) continue
+      const rest = p.slice(dir.length)
+      const i = rest.indexOf('/')
+      names.set(i === -1 ? rest : rest.slice(0, i), i === -1 ? 'file' : 'dir')
+    }
+    return { value: [...names].map(([name, kind]) => ({ name, kind, size: 0, mtimeMs: 0, isLink: false })) }
   })
-  on('command.run', (_$, e: { command: string }) => {
+  on('fs.read', (_$, e: { path: string }) => files.has(norm(e.path)) ? { value: files.get(norm(e.path)) ?? '' } : { deny: 'missing' })
+  on('fs.write', (_$, e: { path: string; text: string }) => { files.set(norm(e.path), e.text); return { value: undefined } })
+  on('model.fork', async (_$, e: { prompt: string }) => {
+    forks.push(e.prompt)
+    const isDistill = e.prompt.includes('=== ACTIONS ===')
+    if (isDistill) await onFork?.()
+    await forkGate?.()
+    if (!isDistill && failHandoff) return { value: { isAnswered: false as const, reason: 'nothing-to-fork' as const } }
+    const text = isDistill ? distillReply : 'HANDOFF: 測試'
+    return { value: { isAnswered: true as const, text, usage: usage(tokens) } }
+  })
+  on('command.register', (_$, e: { name: string }) => ({ value: { command: e.name } }))
+  on('session.start', (_$, e: { cwd: string }) => ({ cwd: e.cwd }))
+  on('prompt.context', (_$, e) => ({ blocks: [...e.blocks] }))
+  on('command.run', async (_$, e: { command: string }) => {
     commands.push(e.command)
+    await onClear?.()
     return { text: '' }
   })
   on('turn.complete', () => ({ text: '' }))
+  on('classic.Stop', () => (stopBlock !== undefined ? { block: stopBlock } : {}))
   on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', type: 'general-purpose' })) }))
-  on('tool.call', (_$, e: { tool: string }) => e.tool === 'Workflow'
-    ? { result: {}, text: 'Workflow started in the background. Task ID: wf_abc123' }
-    : { result: { stdout: '', stderr: '', interrupted: false, backgroundTaskId: 'bg123456' } })
-  on('prompt.submit', (_$, e: { text?: string }) => {
+  on('prompt.submit', (_$, e: { text?: string; context?: readonly string[] }) => {
+    // 送不進對話：被丟棄（hook 丟例外只會被引擎略過，不會讓 $.prompt.submit 失敗）
+    if (failSubmits > 0) { failSubmits -= 1; return { drop: 'submit boom' } }
     submits.push(e.text ?? '')
-    return { text: e.text ?? '' }
+    contexts.push(e.context)
+    return { text: e.text ?? '', context: e.context }
   })
-  return { clock, forks, commands, submits }
+  return { clock, forks, commands, submits, contexts, toasts, files, logs, get, put }
 }
 
-const resume = ($: Engine) =>
-  $.command.run({ command: 'handoff-resume', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+const NOTE_TAG = '[ctx-handoff 專案經驗]'
+const DAY = 24 * 60 * 60_000
+const presentation = { isFullscreen: false, columns: 80 }
+const composer = { kind: 'composer' as const }
+const cmd = ($: Engine, args: string) =>
+  $.command.run({ command: 'handoff', args, origin: composer, presentation })
+const resume = ($: Engine) => cmd($, 'resume')
+const say = ($: Engine, text: string) => $.prompt.submit({ text, origin: composer, wait: false })
+const startSession = ($: Engine) => $.session.start({ cwd: 'C:/proj', surface: null, isInteractive: true })
+const task = (status = 'running') => ({ id: 'b1', type: 'shell', status, description: 'sleep 999' })
+const cron = (recurring: boolean) => ({ id: 'c1', schedule: '0 9 * * *', recurring, prompt: 'check' })
 
 const endTurn = ($: Engine) =>
   $.turn.complete({ answer: 'ok', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
 
+// 主對話停下來：門檻交接在這裡判斷（含背景工作與排程快照）
+const stop = ($: Engine, extra: Partial<Parameters<Engine['classic']['Stop']>[0]> = {}) =>
+  $.classic.Stop({ stop_hook_active: false, background_tasks: [], session_crons: [], ...extra })
+
 test('達 600k：產生 handoff → /clear → 送出', async ($, on) => {
   const w = world(on, 650_000)
-  await endTurn($)
+  await stop($)
   await w.clock.advance(0)
   expect(w.forks.length).toBe(1)
   expect(w.commands).toEqual(['clear'])
@@ -52,7 +150,7 @@ test('達 600k：產生 handoff → /clear → 送出', async ($, on) => {
 
 test('200k 視窗：門檻降為 160k', async ($, on) => {
   const w = world(on, 170_000, 200_000)
-  await endTurn($)
+  await stop($)
   await w.clock.advance(0)
   expect(w.commands).toEqual(['clear'])
 })
@@ -74,7 +172,7 @@ test('門檻以下閒置：刷新 3 次後存離席 handoff，不 /clear', async
   // 之後不再排計時器
   await w.clock.advance(5 * 60 * 60_000)
   expect(w.forks.length).toBe(4)
-  // 存下的離席 handoff 能用 /handoff-resume 取回
+  // 存下的離席 handoff 能用 /handoff resume 取回
   await resume($)
   await w.clock.advance(0)
   expect(w.commands).toEqual(['clear'])
@@ -96,7 +194,7 @@ test('context 太小：不刷新也不產生 handoff', async ($, on) => {
   expect(w.forks).toEqual([])
 })
 
-test('handoff-resume：/clear 後送出 handoff 和被攔下的訊息', async ($, on) => {
+test('handoff resume：/clear 後送出 handoff 和被攔下的訊息', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, { 'away:S1': { handoff: 'HANDOFF: 測試', held: '我回來了' } })
   await resume($)
   await w.clock.advance(0)
@@ -109,34 +207,973 @@ test('handoff-resume：/clear 後送出 handoff 和被攔下的訊息', async ($
   expect(w.commands).toEqual(['clear'])
 })
 
-test('背景 shell 還在跑：延後 handoff，通知到了再做', async ($, on) => {
-  const w = world(on, 650_000)
-  await $.tool.call({ tool: 'Bash', command: 'sleep 999', run_in_background: true })
-  await endTurn($)
-  await w.clock.advance(0)
-  expect(w.commands).toEqual([])
-  // 背景工作結束的通知會帶 task id，並觸發下一個回合
-  await $.prompt.submit({ text: '<task-notification> bg123456 completed', origin: { kind: 'task-notification' }, wait: false })
-  await endTurn($)
-  await w.clock.advance(0)
-  expect(w.commands).toEqual(['clear'])
-})
-
 test('子代理還在跑：延後 handoff', async ($, on) => {
   const w = world(on, 650_000, 1_000_000, {}, [{ id: 'a1', status: 'running' }])
-  await endTurn($)
+  await stop($)
   await w.clock.advance(0)
   expect(w.commands).toEqual([])
 })
 
-test('背景 Workflow：從輸出抓到 task id，延後到通知再做', async ($, on) => {
+test('handoff dry：產生 handoff 並回報用量，不 /clear', async ($, on) => {
   const w = world(on, 650_000)
-  await $.tool.call({ tool: 'Workflow', script: 'export const meta = {}' })
+  const r = await cmd($, 'dry')
+  expect(w.forks.length).toBe(1)
+  expect(w.commands).toEqual([])
+  expect(r.text).toContain('HANDOFF: 測試')
+  expect(r.text).toContain('快取讀 650,000')
+  const s = await cmd($, '')
+  // 用法裡也有 dry，所以比對狀態行的格式
+  expect(s.text).toContain(' dry，context')
+  expect(s.text).toContain('輸出 1')
+})
+
+test('handoff：不帶參數顯示狀態和用法，不認得的子指令只回用法、不動作', async ($, on) => {
+  const w = world(on, 650_000)
+  const s = await cmd($, '')
+  expect(s.text).toContain('門檻')
+  expect(s.text).toContain('/handoff now')
+  expect(s.text).toContain('/handoff resend')
+  const u = await cmd($, 'nwo')
+  expect(u.text).toContain('不認得「nwo」')
+  expect(w.forks.length).toBe(0)
+  expect(w.commands).toEqual([])
+})
+
+const NOTES = 'C:/Users/u/.claude/projects/C--proj/memory/ctx-handoff.md'
+const distillNow = ($: Engine) => cmd($, 'distill')
+
+test('閒置刷新順便整理：寫入專案經驗檔、濾掉疑似金鑰、差異排入下一則訊息，沒新訊息就只刷新', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  await $.prompt.submit({ text: '請幫我  整理\n這段對話', origin: composer, wait: false })
   await endTurn($)
+  await w.clock.advance(55 * 60_000)
+  expect(w.forks.length).toBe(1)
+  expect(w.forks[0]).toContain('範圍：整段對話')
+  const notes = w.files.get(NOTES) ?? ''
+  expect(notes).toContain('## 記憶\n- [project] 使用者決定交接門檻維持 600k')
+  expect(notes).not.toContain('api_key')
+  expect(notes).toContain('### 先實測再下結論（1 次）')
+  expect(notes).toContain('- 根據：1970-01-01 fork 能否讀寫靠實測才確定')
+  const status = await cmd($, '')
+  expect(status.text).toContain('新增記憶：[project] 使用者決定交接門檻維持 600k')
+  // 第二次刷新：沒有新訊息，只回 OK
+  await w.clock.advance(55 * 60_000)
+  expect(w.forks[1]).toBe('只回覆 OK')
+  // 差異不用 session.append，而是跟著下一則送進對話的訊息
+  await say($, '下一則')
+  expect(w.contexts[1]?.[0]).toContain(NOTE_TAG)
+  expect(w.contexts[1]?.[0]).toContain('新增記憶：[project] 使用者決定交接門檻維持 600k')
+})
+
+test('交接前整理一次，再 /clear', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, {}, [], 5)
+  await stop($)
+  await w.clock.advance(0)
+  expect(w.forks.length).toBe(2)
+  expect(w.forks.some(f => f.includes('=== ACTIONS ==='))).toBe(true)
+  expect(w.commands).toEqual(['clear'])
+  expect(w.files.get(NOTES) ?? '').toContain('600k')
+})
+
+const EXISTING = [
+  '# ctx-handoff 專案經驗',
+  '',
+  '## 記憶',
+  '- [feedback] 舊 A',
+  '- [project] 舊 B',
+  '',
+  '## 規則',
+  '',
+  '### 規則一（1 次）',
+  '- 規則：做 X',
+  '- 根據：1970-01-01 第一次',
+  '',
+  '### 規則二（2 次）',
+  '- 規則：做 Y',
+  '',
+].join('\n')
+
+test('依編號套用新增／更新／刪除／確認，超出範圍的忽略；錨點接續上次', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'distill:S1': { turn: 3, anchor: '上次最後一則訊息' } }, [], 6)
+  w.files.set(NOTES, EXISTING)
+  distillReply = actionsReply(
+    { op: 'update_memory', id: 'P1-M1', type: 'feedback', text: '改過的 A' },
+    { op: 'delete_memory', id: 'P1-M2', reason: '已過時' },
+    { op: 'add_memory', type: 'user', text: '新的偏好' },
+    { op: 'delete_memory', id: 'P1-M9', reason: '超出範圍' },
+    { op: 'confirm_rule', id: 'P1-R1', evidence: '又被證實一次' },
+    { op: 'delete_rule', id: 'P1-R2', reason: '被推翻' },
+    { op: 'confirm_rule', id: 'P1-R9', evidence: '超出範圍' },
+    { op: 'add_rule', name: '沒有規則內容的條目', evidence: '缺規則，應丟棄' },
+  )
+  await distillNow($)
+  expect(w.forks[0]).toContain('使用者說「上次最後一則訊息」')
+  expect(w.forks[0]).toContain('P1-M1 [feedback] 舊 A')
+  expect(w.forks[0]).toContain('P1-R2 規則二｜出現 2 次｜做 Y')
+  const notes = w.files.get(NOTES) ?? ''
+  expect(notes).toContain('- [feedback] 改過的 A\n- [user] 新的偏好')
+  expect(notes).not.toContain('舊 B')
+  expect(notes).toContain('### 規則一（2 次）\n- 規則：做 X\n- 根據：1970-01-01 第一次\n- 根據：1970-01-01 又被證實一次')
+  expect(notes).not.toContain('規則二')
+  expect(notes).not.toContain('沒有規則內容')
+})
+
+test('新對話開頭帶入記憶與出現 2 次以上的規則', async ($, on) => {
+  const w = world(on, 100_000)
+  w.files.set(NOTES, EXISTING)
+  const r = await $.prompt.context({ blocks: [{ name: 'currentDate', text: 'today' }] })
+  const block = r.blocks.find(b => b.name === 'ctxHandoffProject')
+  expect(r.blocks[0]?.name).toBe('currentDate')
+  expect(block?.text).toContain('- [feedback] 舊 A')
+  expect(block?.text).toContain('- 規則二（2 次）：做 Y')
+  expect(block?.text).not.toContain('規則一')
+})
+
+test('沒有經驗檔：新對話開頭不帶入', async ($, on) => {
+  world(on, 100_000)
+  const r = await $.prompt.context({ blocks: [] })
+  expect(r.blocks).toEqual([])
+})
+
+test('整理期間檔案被手動修改：不套用、不排入，下次重新整理同一段', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(NOTES, EXISTING)
+  onFork = () => { w.files.set(NOTES, `${EXISTING}\n- [user] 使用者剛手動加的\n`) }
+  const r = await distillNow($)
+  expect(r.text).toContain('整理期間檔案被修改')
+  expect(w.files.get(NOTES) ?? '').toContain('使用者剛手動加的')
+  await say($, '下一則')
+  expect(w.contexts[0]).toBeUndefined()
+  // 沒有推進進度：下次還會整理
+  onFork = undefined
+  await distillNow($)
+  expect(w.forks.length).toBe(2)
+})
+
+test('每 30 則訊息整理一次；不到 30 則不整理', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 30)
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.forks.length).toBe(1)
+  // 再結束一個回合：上次已整理到第 30 則，不再觸發
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.forks.length).toBe(1)
+})
+
+test('重複整理：同一條記憶不會重複寫入，沒有變動就不排入', async ($, on) => {
+  let n = 5
+  const w = world(on, 100_000, 1_000_000, {}, [], () => n)
+  await distillNow($)
+  n = 9
+  distillReply = actionsReply({ op: 'add_memory', type: 'project', text: '使用者決定交接門檻維持 600k' })
+  await distillNow($)
+  const notes = w.files.get(NOTES) ?? ''
+  expect(notes.split('使用者決定交接門檻維持 600k').length).toBe(2)
+  expect(notes.split('## 記憶').length).toBe(2)
+  // 只有第一次的變動被排入：帶入一次，內容不重複
+  await say($, '下一則')
+  expect((w.contexts[0]?.[0] ?? '').split('新增記憶').length).toBe(2)
+})
+
+test('錨點：記下使用者最後一則訊息，下次整理從它之後開始', async ($, on) => {
+  let n = 5
+  const w = world(on, 100_000, 1_000_000, {}, [], () => n)
+  await $.prompt.submit({ text: '請幫我  整理\n這段對話', origin: composer, wait: false })
+  await $.prompt.submit({ text: '/handoff', origin: composer, wait: false })
+  await distillNow($)
+  expect(w.forks[0]).toContain('範圍：整段對話')
+  n = 9
+  await distillNow($)
+  expect(w.forks[1]).toContain('使用者說「請幫我 整理 這段對話」')
+})
+
+// ---------- S1：交接期間訊息不遺失 ----------
+
+test('S1 門檻交接期間：人類訊息被攔下，最終送出的文字包含它', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, {}, [], 5)
+  onFork = async () => { await say($, '中途訊息') }
+  await stop($)
+  await w.clock.settle()
+  expect(w.commands).toEqual(['clear'])
+  // 中途訊息沒有在舊對話送出，而是包進交接的文字
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]).toContain('HANDOFF: 測試')
+  expect(w.submits[0]).toContain('交接期間收到的使用者訊息')
+  expect(w.submits[0]).toContain('中途訊息')
+})
+
+test('S1 /clear 完成後、送出前到的訊息：另外接在 handoff 之後送出', async ($, on) => {
+  const w = world(on, 650_000)
+  onClear = async () => { await say($, '晚到的訊息') }
+  await stop($)
+  await w.clock.settle()
+  expect(w.commands).toEqual(['clear'])
+  expect(w.submits.length).toBe(2)
+  expect(w.submits[0]).toContain('HANDOFF: 測試')
+  expect(w.submits[0]).not.toContain('晚到的訊息')
+  expect(w.submits[1]).toBe('晚到的訊息')
+})
+
+test('S1 /handoff dry 進行中：人類訊息不被攔下', async ($, on) => {
+  const w = world(on, 100_000)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => { release = r })
+  forkGate = () => gate
+  const run = cmd($, 'dry')
+  await w.clock.settle()
+  expect(w.forks.length).toBe(1)
+  await say($, '人類訊息')
+  expect(w.submits).toEqual(['人類訊息'])
+  release()
+  await run
+})
+
+test('S1 離席 handoff 產生中：不被 S1 攔下', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { refresh: false })
+  await endTurn($)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => { release = r })
+  forkGate = () => gate
+  await w.clock.advance(55 * 60_000)
+  expect(w.forks.length).toBe(1)
+  await say($, '人類訊息')
+  expect(w.submits).toEqual(['人類訊息'])
+  release()
+  await w.clock.settle()
+  expect(w.get('away:S1')).toBeDefined()
+})
+
+test('S1 handoff fork 失敗：攔下的訊息在舊對話重新送出', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, {}, [], 5)
+  failHandoff = true
+  onFork = async () => { await say($, '中途訊息') }
+  await stop($)
+  await w.clock.settle()
+  expect(w.commands).toEqual([])
+  expect(w.submits).toEqual(['中途訊息'])
+})
+
+test('S1 交接 fork 與交接前整理同時發出', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, {}, [], 5)
+  let release: () => void = () => {}
+  const gate = new Promise<void>(r => { release = r })
+  forkGate = () => gate
+  await stop($)
+  await w.clock.settle()
+  // 兩個 fork 都還沒回來就都已經發出
+  expect(w.forks.length).toBe(2)
+  expect(w.commands).toEqual([])
+  release()
+  await w.clock.settle()
+  expect(w.commands).toEqual(['clear'])
+})
+
+// ---------- S2：差異跟著下一則送進對話的訊息 ----------
+
+test('S2 被攔下的訊息與斜線指令不消耗排入的差異，下一則真正送出的才帶入、再下一則不帶', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'away:S1': { handoff: 'H' } }, [], 5)
+  await distillNow($)
+  // 離席 handoff 攔下第一則：不帶入
+  await say($, '被攔下的訊息')
+  expect(w.submits).toEqual([])
+  // 斜線指令：不帶入
+  await say($, '/handoff')
+  expect(w.submits).toEqual(['/handoff'])
+  expect(w.contexts[0]).toBeUndefined()
+  // 再送一次＝繼續舊對話：真正進入對話，帶入差異
+  await say($, '被攔下的訊息')
+  expect(w.contexts[1]?.[0]).toContain(NOTE_TAG)
+  expect(w.contexts[1]?.[0]).toContain('新增記憶')
+  // 已經用掉
+  await say($, '再下一則')
+  expect(w.contexts[2]).toBeUndefined()
+})
+
+test('S2 交接前整理不排入差異', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, {}, [], 5)
+  await stop($)
+  await w.clock.settle()
+  expect(w.files.get(NOTES) ?? '').toContain('600k')
+  await say($, '新對話第一則')
+  expect(w.contexts.at(-1)).toBeUndefined()
+})
+
+// ---------- S3、S4：整理提示 ----------
+
+test('S3 整理提示：找不到錨點而改看整段時不得 CONFIRM', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'distill:S1': { turn: 1, anchor: '某則訊息' } }, [], 5)
+  await distillNow($)
+  expect(w.forks[0]).toContain('找不到錨點而改看整段時，只能 add／update／delete，不得 confirm_rule')
+})
+
+test('S4 整理提示：開頭是 [ctx-handoff] 的訊息只是 handoff 摘要，不當證據', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  await distillNow($)
+  expect(w.forks[0]).toContain('開頭是 [ctx-handoff] 的訊息是 handoff 摘要，只能參考，不能當作證據，也不能 confirm_rule')
+})
+
+// ---------- S5：store 鍵分專案、清理 ----------
+
+const saved = (kind: string, tokens: number) => ({ at: 5, sessionId: 'S1', kind, tokens, text: 'x' })
+
+test('S5 狀態只顯示目前專案的資訊', async ($, on) => {
+  world(on, 100_000, 1_000_000, {
+    handoffs: [saved('present', 999)],
+    'handoffs:OTHER': [saved('manual', 888)],
+    'handoffs:C--proj': [saved('away', 123)],
+    'distill:last': { at: 1, why: '舊全域', changes: [], file: 'f', usage: 'u' },
+    'distill:last:OTHER': { at: 1, why: '別的專案', changes: [], file: 'f', usage: 'u' },
+    'distill:error': { at: 9, why: '舊全域錯誤', reason: 'r1' },
+    'handoff:error:OTHER': { at: 9, sessionId: 'Z', kind: 'present', reason: '別的專案的失敗', tokens: 1, turns: 1 },
+  })
+  const s = (await cmd($, '')).text
+  expect(s).toContain(' away，context 123')
+  expect(s).not.toContain('999')
+  expect(s).not.toContain('888')
+  expect(s).not.toContain('舊全域')
+  expect(s).not.toContain('別的專案')
+})
+
+test('S5 session.start：舊的全域 handoffs 只搬屬於這個專案的，一次，舊鍵不動', async ($, on) => {
+  const old = [saved('present', 1), { ...saved('manual', 2), sessionId: 'ZZ' }]
+  const w = world(on, 100_000, 1_000_000, { handoffs: old })
+  await startSession($)
+  expect(w.get('handoffs:C--proj')).toEqual([old[0]])
+  expect(w.get('handoffs')).toEqual(old)
+  expect(w.get('migrated:C--proj')).toBe(true)
+  await startSession($)
+  expect(w.get('handoffs:C--proj')).toEqual([old[0]])
+})
+
+const staleAway = { handoff: 'H', held: '攔下的訊息' }
+
+test('S5 清理：舊字串值與 away 不被改寫，只記下第一次看到的時間', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'last:x': '舊的字串錨點', 'away:y': staleAway })
+  await startSession($)
+  expect(w.get('last:x')).toBe('舊的字串錨點')
+  expect(w.get('away:y')).toEqual(staleAway)
+  const seen = (w.get('seen')) as Record<string, number>
+  expect(Object.keys(seen).sort()).toEqual(['away:y', 'last:x'])
+})
+
+test('S5 清理：第一次看到超過 30 天的刪除、1 天的保留', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'last:x': '舊的字串錨點', 'away:y': staleAway, seen: { 'last:x': 0, 'away:y': 30 * DAY } })
+  await w.clock.set(31 * DAY)
+  await startSession($)
+  expect(w.get('last:x')).toBeUndefined()
+  expect(w.get('away:y')).toEqual(staleAway)
+  expect(Object.keys((w.get('seen')) as Record<string, number>)).toEqual(['away:y'])
+})
+
+test('S5 新程式建立的每 session 鍵也記進 seen；已經記錄的時間不重寫', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { seen: { 'last:S1': 1 } }, [], 5)
+  await w.clock.set(5 * DAY)
+  await say($, '一則訊息')
+  await distillNow($)
+  const seen = w.get('seen') as Record<string, number>
+  expect(seen['last:S1']).toBe(1)
+  expect(seen['distill:S1']).toBe(5 * DAY)
+})
+
+// ---------- S6：失敗可見、可重送、重試有間隔 ----------
+
+test('S6 交接失敗：記錄原因、下一則不重試、3 則之後重試', async ($, on) => {
+  let turns = 10
+  const w = world(on, 650_000, 1_000_000, { distill: false }, [], () => turns)
+  failHandoff = true
+  await stop($)
+  await w.clock.settle()
+  expect(w.forks.length).toBe(1)
+  const err = (w.get('handoff:error:C--proj')) as { reason: string; sessionId: string; turns: number; kind: string }
+  expect(err.reason).toContain('產生失敗')
+  expect(err.sessionId).toBe('S1')
+  expect(err.turns).toBe(10)
+  expect(err.kind).toBe('present')
+  expect((await cmd($, '')).text).toContain('最近失敗')
+  failHandoff = false
+  turns = 11
+  await stop($)
+  await w.clock.settle()
+  expect(w.forks.length).toBe(1)
+  turns = 13
+  await stop($)
+  await w.clock.settle()
+  expect(w.forks.length).toBe(2)
+  expect(w.commands).toEqual(['clear'])
+})
+
+test('S6 交接失敗：滿 10 分鐘也會重試', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, { distill: false })
+  failHandoff = true
+  await stop($)
+  await w.clock.settle()
+  failHandoff = false
+  await stop($)
+  await w.clock.settle()
+  expect(w.forks.length).toBe(1)
+  await w.clock.advance(10 * 60_000)
+  await stop($)
+  await w.clock.settle()
+  expect(w.forks.length).toBe(2)
+  expect(w.commands).toEqual(['clear'])
+})
+
+test('S6 兩個 session 各寫自己的 pendingSubmit：第二個成功只刪自己的', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, { distill: false })
+  failSubmits = 1
+  await stop($)
+  await w.clock.settle()
+  expect(typeof (w.get('pendingSubmit:S1'))).toBe('string')
+  curSid = 'S2'
+  await cmd($, 'now')
+  await w.clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.get('pendingSubmit:S2')).toBeUndefined()
+  expect(typeof (w.get('pendingSubmit:S1'))).toBe('string')
+})
+
+test('S6 攔下訊息＋/clear 成功＋送出失敗：/handoff resend 送出 handoff 與訊息，刪掉 pending', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, {}, [], 5)
+  failSubmits = 1
+  onFork = async () => { await say($, '中途訊息') }
+  await stop($)
+  await w.clock.settle()
+  expect(w.submits).toEqual([])
+  const pending = (w.get('pendingSubmit:S1')) as string
+  expect(pending).toContain('HANDOFF: 測試')
+  expect(pending).toContain('中途訊息')
+  expect((await cmd($, '')).text).toContain('未送達的 handoff')
+  await cmd($, 'resend')
+  await w.clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]).toContain('HANDOFF: 測試')
+  expect(w.submits[0]).toContain('中途訊息')
+  expect(w.get('pendingSubmit:S1')).toBeUndefined()
+  expect((await cmd($, '')).text).not.toContain('未送達的 handoff')
+  // /clear 只有交接那一次，resend 不再 /clear
+  expect(w.commands).toEqual(['clear'])
+})
+
+test('S6 新 process 的 resend：不送別的 session 的 pending；有本 process 產生的 handoff 才重送它', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'pendingSubmit:OTHER': '別的 session 的文字' })
+  const r = await cmd($, 'resend')
+  expect(r.text).toContain('沒有可以重送')
+  await w.clock.settle()
+  expect(w.submits).toEqual([])
+  await cmd($, 'dry')
+  await cmd($, 'resend')
+  await w.clock.settle()
+  expect(w.submits.length).toBe(1)
+  expect(w.submits[0]).toContain('HANDOFF: 測試')
+  expect(w.submits[0]).not.toContain('別的 session')
+  expect(typeof (w.get('pendingSubmit:OTHER'))).toBe('string')
+})
+
+// ---------- S7：經驗檔手動編輯不被吃掉 ----------
+
+const stripStamp = (s: string) => s.replace(/^> 最後更新：.*$/m, '')
+
+test('S7 真實經驗檔複本：解析再輸出（扣掉更新時間）完全相同', async ($, on) => {
+  let n = 5
+  const w = world(on, 100_000, 1_000_000, {}, [], () => n)
+  w.files.set(NOTES, NOTES_FIXTURE)
+  const items = NOTES_FIXTURE.split('\n').filter(l => l.startsWith('- [')).length
+  // 先加一條再刪掉：兩次都經過 parse → render，結果要回到原樣
+  distillReply = actionsReply({ op: 'add_memory', type: 'project', text: '暫時的一條' })
+  await distillNow($)
+  expect(w.files.get(NOTES) ?? '').toContain('暫時的一條')
+  n = 9
+  distillReply = actionsReply({ op: 'delete_memory', id: `P1-M${items + 1}`, reason: '還原' })
+  await distillNow($)
+  const out = w.files.get(NOTES) ?? ''
+  expect(out).not.toContain('暫時的一條')
+  expect(stripStamp(out)).toBe(stripStamp(NOTES_FIXTURE))
+})
+
+test('S7 記憶的延續行與自訂區段原樣保留；同名規則的 ADD 略過', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(NOTES, [
+    '# ctx-handoff 專案經驗',
+    '',
+    '> 由 ctx-handoff 背景整理維護，可以直接編輯。新對話開頭會帶入記憶，以及出現 2 次以上的規則。',
+    '> 最後更新：2026-01-01 00:00',
+    '',
+    '## 記憶',
+    '- [user] 第一條',
+    '  延續行 A',
+    '  - 縮排子項',
+    '- [project] 第二條',
+    '',
+    '## 規則',
+    '',
+    '### 規則甲（2 次）',
+    '- 規則：做甲',
+    '- 根據：2026-01-01 一',
+    '',
+    '## 備註',
+    '手動備註第一行',
+    '- 備註清單',
+    '',
+  ].join('\n'))
+  distillReply = actionsReply(
+    { op: 'add_memory', type: 'user', text: '新增的一條' },
+    { op: 'add_rule', name: '規則甲', rule: '重複的內容', applies: 'x', not_applies: 'y', evidence: '重複' },
+    { op: 'add_rule', name: '規則乙', rule: '做乙', applies: 'x', not_applies: 'y', evidence: '新的' },
+  )
+  await distillNow($)
+  expect(w.forks[0]).toContain('P1-M1 [user] 第一條\n  延續行 A\n  - 縮排子項')
+  const out = w.files.get(NOTES) ?? ''
+  expect(out).toContain('## 記憶\n- [user] 第一條\n  延續行 A\n  - 縮排子項\n- [project] 第二條\n- [user] 新增的一條\n')
+  expect(out).toContain('### 規則甲（2 次）\n- 規則：做甲\n- 根據：2026-01-01 一\n')
+  expect(out).not.toContain('重複的內容')
+  expect(out.split('### 規則甲').length).toBe(2)
+  expect(out).toContain('### 規則乙（1 次）')
+  expect(out).toContain('## 備註\n手動備註第一行\n- 備註清單\n')
+  // 自訂區段在規則之後
+  expect(out.indexOf('## 備註')).toBeGreaterThan(out.indexOf('### 規則乙'))
+})
+
+test('S7 記憶超過 40 條：狀態顯示有幾條不會帶入', async ($, on) => {
+  const w = world(on, 100_000)
+  const memory = Array.from({ length: 42 }, (_, i) => `- [project] 第 ${i + 1} 條`)
+  w.files.set(NOTES, ['# ctx-handoff 專案經驗', '', '## 記憶', ...memory, '', '## 規則', ''].join('\n'))
+  const s = (await cmd($, '')).text
+  expect(s).toContain('有 2 條不會帶入新對話')
+})
+
+// ---------- S8：背景工作與排程（classic.Stop） ----------
+
+test('S8 背景 shell 還在跑：不 /clear，狀態看得到原因，只提醒一次；結束後的 Stop 才交接', async ($, on) => {
+  const w = world(on, 650_000)
+  await stop($, { background_tasks: [task()] })
   await w.clock.advance(0)
   expect(w.commands).toEqual([])
-  await $.prompt.submit({ text: '<task-notification> wf_abc123 completed', origin: { kind: 'task-notification' }, wait: false })
-  await endTurn($)
+  await stop($, { background_tasks: [task()] })
+  await w.clock.advance(0)
+  expect(w.commands).toEqual([])
+  expect(w.toasts.filter(t => t.includes('延後')).length).toBe(1)
+  expect((await cmd($, '')).text).toContain('handoff 延後')
+  await stop($, { background_tasks: [task('completed')] })
   await w.clock.advance(0)
   expect(w.commands).toEqual(['clear'])
+})
+
+test('S8 別的 Stop hook 要求繼續：這次不交接，真正停下的那次才交接', async ($, on) => {
+  const w = world(on, 650_000, 1_000_000, { distill: false })
+  stopBlock = '繼續工作'
+  await stop($)
+  await w.clock.advance(0)
+  expect(w.forks).toEqual([])
+  expect(w.commands).toEqual([])
+  stopBlock = undefined
+  await stop($, { stop_hook_active: true })
+  await w.clock.advance(0)
+  expect(w.commands).toEqual(['clear'])
+})
+
+test('S2 下層 hook 丟棄訊息：差異不被消耗，下一則才帶入', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  await distillNow($)
+  failSubmits = 1
+  const r = await say($, '被下層丟棄')
+  expect((r as { drop?: string }).drop).toBe('submit boom')
+  await say($, '下一則')
+  expect(w.contexts[0]?.[0]).toContain(NOTE_TAG)
+})
+
+test('S8 一次性排程還在：不 /clear', async ($, on) => {
+  const w = world(on, 650_000)
+  await stop($, { session_crons: [cron(false)] })
+  await w.clock.advance(0)
+  expect(w.commands).toEqual([])
+})
+
+test('S8 只有循環排程：照常 /clear', async ($, on) => {
+  const w = world(on, 650_000)
+  await stop($, { session_crons: [cron(true)] })
+  await w.clock.advance(0)
+  expect(w.commands).toEqual(['clear'])
+})
+
+test('S8 超過上限：背景工作還在也交接，並在開頭註明', async ($, on) => {
+  // 視窗 1M：門檻 600k，上限 min(900k, 750k) = 750k
+  const w = world(on, 760_000)
+  await stop($, { background_tasks: [task()] })
+  await w.clock.advance(0)
+  expect(w.commands).toEqual(['clear'])
+  expect(w.submits[0]).toContain('交接時仍有1 個背景工作在執行')
+})
+
+// ---------- S9：離席流程 ----------
+
+test('S9 離席：第二則不同文字的訊息連同先前攔下的一起送進舊對話；相同文字則照原樣', async ($, on) => {
+  const away = { handoff: 'H', held: '第一則' }
+  const w = world(on, 100_000, 1_000_000, { 'away:S1': away })
+  await say($, '第二則')
+  expect(w.submits).toEqual(['第一則\n\n第二則'])
+  expect(w.get('away:S1')).toBeUndefined()
+  w.put('away:S1', away)
+  await say($, '第一則')
+  expect(w.submits[1]).toBe('第一則')
+  expect(w.get('away:S1')).toBeUndefined()
+})
+
+test('S9 離席 handoff 存好後主對話又完成回合：沒有攔下訊息就刪掉離席狀態', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'away:S1': { handoff: 'H' } })
+  await endTurn($)
+  expect(w.get('away:S1')).toBeUndefined()
+})
+
+test('S9 已攔下訊息的離席狀態不會因回合完成被刪', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { 'away:S1': { handoff: 'H', held: '我回來了' } })
+  await endTurn($)
+  expect(w.get('away:S1')).toBeDefined()
+})
+
+// ---------- S10：長路徑專案 ----------
+
+test('S10 編碼後的路徑和實際目錄不同：第二個 session 靠記下的對照找到經驗檔', async ($, on) => {
+  const w = world(on, 100_000)
+  const base = 'C:/Users/u/.claude/projects'
+  w.files.delete(`${base}/C--proj/S1.jsonl`)
+  w.files.set(`${base}/LONG/S1.jsonl`, '')
+  w.files.set(`${base}/LONG/memory/ctx-handoff.md`, EXISTING)
+  const first = await $.prompt.context({ blocks: [] })
+  expect(first.blocks.find(b => b.name === 'ctxHandoffProject')).toBeDefined()
+  expect(w.get('projdir:C--proj')).toBe(`${base}/LONG`)
+  // 新 session 的對話檔還不存在，掃不到；只能靠對照
+  curSid = 'S2'
+  const second = await $.prompt.context({ blocks: [] })
+  expect(second.blocks.find(b => b.name === 'ctxHandoffProject')?.text).toContain('- [feedback] 舊 A')
+})
+
+// ---------- JSONL 動作與依專案分檔 ----------
+
+const CLAUDE_PROJECTS = 'C:/Users/u/.claude/projects'
+const ALPHA = 'D:/repos/alpha'
+const ALPHA_NOTES = `${CLAUDE_PROJECTS}/D--repos-alpha/memory/ctx-handoff.md`
+type World = ReturnType<typeof world>
+// 把 D:/repos/<name> 變成有 .git 的 repo
+const repo = (w: World, dir: string) => { w.files.set(`${dir}/.git`, '') }
+// 模擬磁碟上存在的子資料夾（fs.list 由檔案清單推出資料夾）
+const dir = (w: World, path: string) => { w.files.set(`${path}/.keep`, '') }
+const read = ($: Engine, file: string) => $.tool.call({ tool: 'Read', file_path: file })
+// 整理提示裡「這個對話涉及的專案」那幾行（P<n> 路徑）
+const projectsIn = (prompt: string) => prompt.split('\n').filter(l => /^P\d+ (?!目前)/.test(l))
+const lastOf =(w: World) => w.get('distill:last:C--proj') as { changes: string[]; rejected: { count: number; samples: string[] } }
+
+test('JSONL 一行壞掉、一個不認得的 op：有效的照套用，記下丟棄 2 行與樣本，狀態看得到', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  distillReply = actionsReply(
+    { op: 'add_memory', type: 'user', text: '有效的一條' },
+    '{這不是 JSON',
+    { op: 'explode', text: '不認得的 op' },
+    '',
+    { op: 'add_rule', name: '有效規則', rule: '做 Z', applies: 'a', not_applies: 'b', evidence: 'c' },
+  )
+  const r = await distillNow($)
+  const notes = w.files.get(NOTES) ?? ''
+  expect(notes).toContain('- [user] 有效的一條')
+  expect(notes).toContain('### 有效規則（1 次）\n- 規則：做 Z\n- 適用：a｜不適用：b\n- 根據：1970-01-01 c')
+  const last = lastOf(w)
+  expect(last.rejected.count).toBe(2)
+  expect(last.rejected.samples).toEqual(['{這不是 JSON', '{"op":"explode","text":"不認得的 op"}'])
+  expect(r.text).toContain('丟棄 2 行無效輸出')
+})
+
+test('JSONL 樣本最多 3 個、每個最多 120 字', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  distillReply = actionsReply('x'.repeat(300), 'b', 'c', 'd')
+  await distillNow($)
+  const { rejected } = lastOf(w)
+  expect(rejected.count).toBe(4)
+  expect(rejected.samples).toEqual(['x'.repeat(120), 'b', 'c'])
+})
+
+test('add_memory 指定 P2：只寫進 P2 的經驗檔，P1 不動；變動以專案名稱當前綴', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  repo(w, ALPHA)
+  await read($, `${ALPHA}/src/a.ts`)
+  distillReply = actionsReply({ op: 'add_memory', project: 'P2', type: 'project', text: 'alpha 專屬的決定' })
+  await distillNow($)
+  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('## 記憶\n- [project] alpha 專屬的決定')
+  expect(w.files.has(NOTES)).toBe(false)
+  expect(lastOf(w).changes).toEqual(['[alpha] 新增記憶：[project] alpha 專屬的決定'])
+  // 差異帶入下一則訊息時，前綴與兩個檔案的位置都在
+  await say($, '下一則')
+  expect(w.contexts[0]?.[0]).toContain('[alpha] 新增記憶')
+  expect(w.contexts[0]?.[0]).toContain(ALPHA_NOTES)
+})
+
+test('add_memory／add_rule 省略 project：預設寫進 P1', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  repo(w, ALPHA)
+  await read($, `${ALPHA}/a.ts`)
+  await distillNow($)
+  expect(w.files.get(NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
+  expect(w.files.has(ALPHA_NOTES)).toBe(false)
+})
+
+test('update／delete／confirm 靠 P<n>-M#／P<n>-R# 編號，各專案各自編號；沒列出的專案與超出範圍的編號丟棄', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(NOTES, EXISTING)
+  w.files.set(ALPHA_NOTES, EXISTING)
+  repo(w, ALPHA)
+  await read($, `${ALPHA}/a.ts`)
+  distillReply = actionsReply(
+    { op: 'update_memory', id: 'P1-M1', type: 'feedback', text: 'P1 改過的 A' },
+    { op: 'delete_memory', id: 'P2-M2', reason: 'P2 的舊 B 過時' },
+    { op: 'confirm_rule', id: 'P1-R1', evidence: 'P1 又被證實' },
+    { op: 'update_rule', id: 'P2-R2', rule: 'P2 改過的 Y' },
+    { op: 'delete_rule', id: 'P1-R2', reason: 'P1 規則二被推翻' },
+    // 全部應被丟棄：沒有列出的專案、超出範圍、類型與編號種類不符、P0
+    { op: 'delete_memory', id: 'P3-M1', reason: '沒有 P3' },
+    { op: 'delete_memory', id: 'P1-M9', reason: '超出範圍' },
+    { op: 'delete_memory', id: 'P1-M0', reason: '編號從 1 開始' },
+    { op: 'confirm_rule', id: 'P2-R9', evidence: '超出範圍' },
+    { op: 'delete_rule', id: 'P1-M1', reason: 'M 不是規則' },
+    { op: 'delete_memory', id: 'P0-M1', reason: 'P0' },
+    { op: 'add_memory', project: 'P5', type: 'user', text: '沒有 P5' },
+  )
+  await distillNow($)
+  const p1 = w.files.get(NOTES) ?? ''
+  const p2 = w.files.get(ALPHA_NOTES) ?? ''
+  expect(p1).toContain('- [feedback] P1 改過的 A')
+  expect(p1).toContain('- [project] 舊 B')
+  expect(p1).toContain('### 規則一（2 次）')
+  expect(p1).toContain('- 根據：1970-01-01 P1 又被證實')
+  expect(p1).not.toContain('規則二')
+  expect(p2).toContain('- [feedback] 舊 A')
+  expect(p2).not.toContain('舊 B')
+  expect(p2).toContain('- 規則：P2 改過的 Y')
+  expect(p2).toContain('### 規則一（1 次）')
+  expect(lastOf(w).rejected.count).toBe(7)
+  expect(p1 + p2).not.toContain('沒有 P5')
+})
+
+test('疑似金鑰的動作整行丟棄（任何欄位），樣本不記內容', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  distillReply = actionsReply(
+    { op: 'add_memory', type: 'user', text: '正常的一條' },
+    { op: 'add_memory', type: 'user', text: '金鑰 ghp_abcdefghijklmnop' },
+    { op: 'add_rule', name: '規則', rule: '做事', applies: 'a', not_applies: 'b', evidence: 'password=hunter2' },
+    { op: 'delete_memory', id: 'P1-M1', reason: 'token: abc' },
+    '這行不是 JSON 但有 api_key=zzz',
+  )
+  w.files.set(NOTES, EXISTING)
+  await distillNow($)
+  const notes = w.files.get(NOTES) ?? ''
+  expect(notes).toContain('- [user] 正常的一條')
+  expect(notes).toContain('舊 A')
+  expect(notes).not.toMatch(/ghp_|hunter2|api_key/)
+  const { rejected } = lastOf(w)
+  expect(rejected.count).toBe(4)
+  expect(JSON.stringify(rejected.samples)).not.toMatch(/ghp_|hunter2|api_key|token/)
+})
+
+test('欄位裡的換行會收成一個空格，不會寫出多行或新標題', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  distillReply = actionsReply({ op: 'add_memory', type: 'user', text: '第一行\n## 假標題\n第三行' })
+  await distillNow($)
+  const notes = w.files.get(NOTES) ?? ''
+  expect(notes).toContain('- [user] 第一行 ## 假標題 第三行')
+  expect(notes.match(/^## 記憶/gm)?.length).toBe(1)
+})
+
+test('動作的 type 不在 user|feedback|project|reference、缺必要欄位：丟棄', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  distillReply = actionsReply(
+    { op: 'add_memory', type: 'bogus', text: '類型不對' },
+    { op: 'add_memory', text: '沒有類型' },
+    { op: 'add_memory', type: 'user' },
+    { op: 'add_rule', name: '缺欄位', rule: 'r', applies: 'a', evidence: 'e' },
+    { op: 'delete_rule', id: 'P1-R1' },
+  )
+  w.files.set(NOTES, EXISTING)
+  await distillNow($)
+  expect(lastOf(w).rejected.count).toBe(5)
+  expect(w.files.get(NOTES) ?? '').toBe(EXISTING)
+})
+
+test('碰過的專案：有 .git 的目錄列為 P2；session 根目錄底下沒有 .git 的取第一層子資料夾；AppData、隱藏資料夾、根目錄本身不算', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  repo(w, ALPHA)
+  for (const d of ['web', 'lib', 'api']) dir(w, `C:/proj/${d}`)
+  await read($, `${ALPHA}/src/deep/a.ts`)
+  await read($, 'C:/proj/web/src/b.ts')
+  await read($, 'C:/proj/AppData/Local/x.txt')
+  await read($, 'C:/proj/.cache/y.txt')
+  await read($, 'C:/proj/readme.md')
+  await $.tool.call({ tool: 'Glob', pattern: '*', path: 'C:/proj' })
+  await $.tool.call({ tool: 'Grep', pattern: 'x', path: 'C:/proj/lib' })
+  // Bash 沒有路徑欄位，改看目前工作目錄
+  curCwd = 'C:/proj/api/sub'
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  curCwd = 'C:/proj'
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await distillNow($)
+  const p = w.forks[0] ?? ''
+  const listed = projectsIn(p)
+  expect(listed).toEqual([
+    'P1 C:/proj（預設：session 啟動資料夾）',
+    `P2 ${ALPHA}`,
+    'P3 C:/proj/web',
+    'P4 C:/proj/lib',
+    'P5 C:/proj/api',
+  ])
+  expect(p).not.toContain('AppData')
+  expect(p).not.toContain('.cache')
+  expect((await cmd($, '')).text).toContain('本次對話也碰過')
+})
+
+test('碰過的專案：<claude> 底下非 repo 的路徑不算，repo 算；路徑不分大小寫比對', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  curRoot = 'C:\\Users\\u'
+  curCwd = 'C:/Users/u'
+  repo(w, 'C:/Users/u/.claude/mods/ctx-handoff')
+  repo(w, 'C:/Users/u/work')
+  await read($, 'C:/Users/u/.claude/skills/x/SKILL.md')
+  await read($, 'C:/Users/u/.claude/mods/ctx-handoff/hooks/register.ts')
+  await read($, 'C:/Users/u/AppData/Local/Temp/z.txt')
+  await read($, 'C:/Users/u/work/f.ts')
+  // 再碰同一個專案（磁碟代號與路徑大小寫不同）：不重複列出
+  await read($, 'c:/users/u/work/g.ts')
+  await distillNow($)
+  const listed = projectsIn(w.forks[0] ?? '')
+  expect(listed).toEqual([
+    'P1 C:/Users/u（預設：session 啟動資料夾）',
+    'P2 C:/Users/u/.claude/mods/ctx-handoff',
+    'P3 C:/Users/u/work',
+  ])
+})
+
+test('碰過的專案：session 根目錄自己就在 repo 裡時，整個根目錄屬於 P1，不列出', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  repo(w, 'C:/proj')
+  await read($, 'C:/proj/src/a.ts')
+  await distillNow($)
+  expect(projectsIn(w.forks[0] ?? '')).toEqual(['P1 C:/proj（預設：session 啟動資料夾）'])
+})
+
+test('碰過的專案：根目錄底下的單一檔案、不存在的子資料夾、MCP 工具的 path 都不算；.. 會先解開', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  dir(w, 'C:/proj/api')
+  await $.tool.call({ tool: 'Grep', pattern: 'x', path: 'C:/proj/notes.txt' })
+  await read($, 'C:/proj/ghost/a.ts')
+  await $.tool.call({ tool: 'mcp__x__search', path: 'notes/today' })
+  await read($, 'C:/proj/web/../api/x.ts')
+  await distillNow($)
+  expect(projectsIn(w.forks[0] ?? '')).toEqual(['P1 C:/proj（預設：session 啟動資料夾）', 'P2 C:/proj/api'])
+})
+
+test('碰過的專案最多記 8 個，超過就丟最舊的', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  for (let i = 1; i <= 10; i++) dir(w, `C:/proj/d${i}`)
+  for (let i = 1; i <= 10; i++) await read($, `C:/proj/d${i}/f.ts`)
+  await distillNow($)
+  const listed = projectsIn(w.forks[0] ?? '')
+  expect(listed.length).toBe(9)
+  expect(listed[1]).toBe('P2 C:/proj/d3')
+  expect(listed[8]).toBe('P9 C:/proj/d10')
+})
+
+test('P2 的經驗檔在 fork 期間被改：只略過 P2 並記下錯誤，P1 的變動照寫', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(ALPHA_NOTES, EXISTING)
+  repo(w, ALPHA)
+  await read($, `${ALPHA}/a.ts`)
+  distillReply = actionsReply(
+    { op: 'add_memory', type: 'user', text: 'P1 的新記憶' },
+    { op: 'add_memory', project: 'P2', type: 'user', text: 'P2 的新記憶' },
+  )
+  const edited = `${EXISTING}\n- [user] 手動加的\n`
+  onFork = () => { w.files.set(ALPHA_NOTES, edited) }
+  await distillNow($)
+  expect(w.files.get(NOTES) ?? '').toContain('P1 的新記憶')
+  expect(w.files.get(ALPHA_NOTES)).toBe(edited)
+  const err = w.get('distill:error:C--proj') as { reason: string }
+  expect(err.reason).toContain('整理期間檔案被修改')
+  expect(err.reason).toContain(ALPHA_NOTES)
+  expect(err.reason).not.toContain(NOTES)
+  // P1 已寫成：進度有推進，只有寫成的變動排入下一則訊息
+  expect(w.get('distill:S1')).toBeDefined()
+  await say($, '下一則')
+  expect(w.contexts.at(-1)?.[0]).toContain('新增記憶：[user] P1 的新記憶')
+  expect(w.contexts.at(-1)?.[0]).not.toContain('P2 的新記憶')
+})
+
+test('首次碰到有經驗檔的專案：下一則人類訊息帶入它的經驗，再碰不重複，斜線指令不消耗，P1 不帶', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(NOTES, EXISTING)
+  w.files.set(ALPHA_NOTES, EXISTING)
+  repo(w, ALPHA)
+  repo(w, 'D:/repos/beta')
+  await read($, `${ALPHA}/a.ts`)
+  // 沒有經驗檔的專案不帶
+  await read($, 'D:/repos/beta/b.ts')
+  // P1 範圍內的路徑不帶 P1 的經驗
+  await read($, 'C:/proj/readme.md')
+  await say($, '/handoff')
+  expect(w.contexts[0]).toBeUndefined()
+  await say($, '第一則')
+  const block = w.contexts[1]?.[0] ?? ''
+  expect(block).toContain(NOTE_TAG)
+  expect(block).toContain(`專案 ${ALPHA}`)
+  expect(block).toContain(ALPHA_NOTES)
+  expect(block).toContain('- [feedback] 舊 A')
+  expect(block).toContain('- 規則二（2 次）：做 Y')
+  expect(w.contexts[1]?.length).toBe(1)
+  // 再碰同一個專案：不再帶入
+  await read($, `${ALPHA}/c.ts`)
+  await say($, '第二則')
+  expect(w.contexts[2]).toBeUndefined()
+})
+
+test('首次碰到專案的經驗在訊息被丟棄時不消耗，下一則才帶入', async ($, on) => {
+  const w = world(on, 100_000)
+  w.files.set(ALPHA_NOTES, EXISTING)
+  repo(w, ALPHA)
+  await read($, `${ALPHA}/a.ts`)
+  failSubmits = 1
+  const r = await say($, '被丟棄')
+  expect((r as { drop?: string }).drop).toBe('submit boom')
+  await say($, '下一則')
+  expect(w.contexts[0]?.[0]).toContain(`專案 ${ALPHA}`)
+})
+
+test('整理提示：有繁體中文指示、專案清單、每個專案各自的記憶與規則編號、JSONL 輸出格式', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(NOTES, EXISTING)
+  w.files.set(ALPHA_NOTES, '# x\n\n## 記憶\n- [user] alpha 的記憶\n\n## 規則\n\n### alpha 規則（3 次）\n- 規則：做 A\n')
+  repo(w, ALPHA)
+  await read($, `${ALPHA}/a.ts`)
+  await distillNow($)
+  const p = w.forks[0] ?? ''
+  expect(p).toContain('一律用繁體中文（台灣）撰寫；程式碼、指令、路徑、錯誤訊息與專有名詞維持原文')
+  expect(p).toContain('P1 C:/proj（預設：session 啟動資料夾）')
+  expect(p).toContain(`P2 ${ALPHA}`)
+  expect(p).toContain('每條都要判斷屬於哪個專案：只屬於某個 repo 的經驗放到那個專案，跨專案通用或不確定的放 P1')
+  expect(p).toContain('P1-M2 [project] 舊 B')
+  expect(p).toContain('P1-R1 規則一｜出現 1 次｜做 X')
+  expect(p).toContain('P2-M1 [user] alpha 的記憶')
+  expect(p).toContain('P2-R1 alpha 規則｜出現 3 次｜做 A')
+  expect(p).toContain('=== ACTIONS ===')
+  expect(p).toContain('=== END ===')
+  expect(p).toContain('{"op":"add_memory","project":"P2","type":"project","text":"…"}')
+  expect(p).toContain('{"op":"delete_rule","id":"P1-R4","reason":"…"}')
+})
+
+test('沒有 ACTIONS 標記的輸出：不套用，記一行丟棄；空的 ACTIONS 區塊視為沒有變動', async ($, on) => {
+  let n = 5
+  const w = world(on, 100_000, 1_000_000, {}, [], () => n)
+  distillReply = '我覺得沒什麼好整理的'
+  await distillNow($)
+  expect(w.files.has(NOTES)).toBe(false)
+  expect(lastOf(w).rejected.count).toBe(1)
+  n = 9
+  distillReply = actionsReply()
+  await distillNow($)
+  expect(w.files.has(NOTES)).toBe(false)
+  expect(lastOf(w).rejected.count).toBe(0)
 })

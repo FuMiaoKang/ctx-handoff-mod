@@ -12,13 +12,25 @@
 
 | 什麼時候 | 會發生什麼 | 你要做什麼 |
 |---|---|---|
-| **回合結束，且 context ≥ 600k**（或視窗的 80%，取較小者） | 如果還有背景 shell、workflow 或子代理在跑，就先等。否則 fork 對話產生 handoff，接著 `/clear` 並送出 handoff。新對話會回報它理解的現況，然後等你指示。 | 不用 |
+| **主對話停下來，且 context ≥ 600k**（或視窗的 80%，取較小者） | 在 Claude Code 的 `Stop` hook 觸發時判斷。如果還有背景工作、一次性排程或子代理在跑就先等（循環排程不算），等到硬上限（見下）為止。否則 fork 對話產生 handoff（同時平行做一次整理），接著 `/clear` 並送出 handoff。新對話會回報它理解的現況，然後等你指示。 | 不用 |
 | **閒置 55 分鐘** | fork 一個很小的請求刷新快取，最多 3 次（合計約 4 小時）。到第 4 次改成存一份「離席 handoff」，而且**不** `/clear`：你不在，所以不替你換對話。 | 不用 |
-| **離席 handoff 存好後你回來** | 先攔下你的第一則訊息，請你選擇。 | `/handoff-resume` 開新對話，帶上 handoff 和這則訊息；`/handoff-continue` 留在原本的對話。 |
+| **離席 handoff 存好後你回來** | 先攔下你的第一則訊息，請你選擇。 | `/handoff resume` 開新對話，帶上 handoff 和這則訊息；`/handoff continue` 留在原本的對話。直接再送一則不同的訊息，則在原本的對話連同先前攔下的那則一起送出。如果舊對話自己往前走了（回合完成、而且沒有攔下的訊息），離席 handoff 會被視為過時而刪除。 |
+
+### 值得知道的行為
+
+- **交接期間打的訊息不會遺失。** 從門檻交接或 `/handoff now` 開始，到 handoff 送出為止，你送的訊息會先被攔下並顯示提示。攔下的訊息會接在 handoff 文字後面一起送出；文字建好之後才到的，會在 handoff 那一輪之後緊接著送出；如果在 `/clear` 之前就失敗，會在原本的對話重新送出。（斜線指令照常通過；`/handoff dry` 與離席 handoff 的產生過程不會攔訊息。）
+- **背景整理的結果跟著你的下一則訊息。** 整理出的差異先排在記憶體裡，附加在下一則真正進入對話的訊息上，當作額外參考。被丟棄的訊息和斜線指令不會消耗它。交接前的那次整理不排入。
+- **整理輸出是 JSONL，由程式套用。** 背景整理仍然只是一次不帶工具的 fork（重用快取）。它在 `=== ACTIONS ===` 與 `=== END ===` 之間，一行輸出一個 JSON 動作（`add_memory`、`update_memory`、`delete_memory`、`add_rule`、`confirm_rule`、`update_rule`、`delete_rule`），一律用繁體中文（台灣），程式碼、指令、路徑、錯誤訊息與專有名詞維持原文。程式逐行驗證（op、必要的字串欄位、`type` 屬於 user|feedback|project|reference、專案與編號存在）；無效的行丟棄並計數，最多保留 3 個截短的樣本，顯示在 `/handoff`。任何欄位疑似金鑰的動作整個丟棄，樣本也不存內容。
+- **從外層資料夾啟動的 session，經驗仍依專案分檔。** session 常從上一層資料夾（例如家目錄或工作區）啟動，再碰好幾個 repo。本 mod 依 session 記錄碰過的專案：從工具的路徑欄位（`file_path`、`path`、`notebook_path`）與 Bash 的工作目錄判斷，取最近、含 `.git` 的上層目錄，否則取 session 根目錄底下的第一層子資料夾（跳過 `AppData` 與點開頭的資料夾）。session 根目錄是 `P1`（預設），碰過的專案依序是 `P2`、`P3`…（最多 8 個，超過丟最舊的）。整理提示會列出每個專案各自的記憶與規則（`P1-M3`、`P2-R1`），要求模型把每條放到它所屬的專案（跨專案通用或不確定的放 `P1`），程式再分別寫進各專案自己的 `ctx-handoff.md`。如果某個專案的檔案在 fork 期間被改過，只略過那一份，錯誤訊息會指出是哪個檔案；其他專案的變動加上專案名稱前綴。
+- **第一次碰到專案時帶入它的經驗。** session 第一次碰到已有經驗檔的專案時，它的經驗會跟著你的下一則真正送出的訊息帶入，每個專案每個 session 最多一次，格式與新對話開頭帶入的相同。`P1` 不會這樣帶（它本來就在對話開頭帶入）。
+- **失敗看得到、救得回來。** 每次交接失敗（產生、`/clear`、送出）都會記錄，並顯示在 `/handoff`。門檻交接失敗後，要再過 3 則使用者訊息或 10 分鐘才會重試。完整文字會在 `/clear` 之前先存成 `pendingSubmit:<session id>`，送出成功才刪；送出失敗時，用 `/handoff resend` 重新送出，不會再 `/clear`。
+- **store 的鍵依專案區分。** handoff 紀錄與整理狀態按專案分開，`/handoff` 只顯示目前專案的資訊。每個 session 一把的鍵在第一次出現 30 天後清除。`refresh` 與 `distill` 開關仍是全域的。
+- **手動編輯經驗檔不會被吃掉。** 多行的記憶條目、不認得的 `## ` 區段與其餘內容，經過整理後會原樣保留。同名的新規則會被略過。`/handoff` 會顯示超過帶入上限 40 條而沒被帶入的記憶數。
+- **延後有硬上限。** 背景工作讓交接一直等時，context 達到 `min(視窗的 90%, 門檻 + 150k)` 就照樣交接，並在 handoff 開頭註明當時還有什麼在跑。
 
 目前的證據：
 - 用 probe mod 實際驗證過幾個基本元件：mod 可以執行 `/clear` 後接著 `prompt.submit`；對 102k token 的對話做 fork 時，102,523 個輸入 token 中有 102,003 個是從快取讀取（約 99.5%）。
-- `claude plugin test`：9/9 通過。涵蓋門檻觸發、200k 視窗、刷新後存離席 handoff、關閉刷新、context 太小時略過、resume，以及背景 shell、背景 workflow 和子代理還在跑時延後。
+- `claude plugin test`：69/69 通過。涵蓋 JSONL 驗證與丟棄樣本、依專案分檔與碰過專案的判斷、fork 期間只略過被改的那份檔案、首次碰到專案時帶入經驗、門檻觸發、200k 視窗、刷新後存離席 handoff、關閉刷新、context 太小時略過、resume、交接期間攔訊息、背景整理差異的帶入、store 鍵分專案與清理、失敗重試間隔與 `/handoff resend`、用真實經驗檔複本驗證解析與輸出、以 `Stop` 為準的延後（背景工作、一次性排程、循環排程、硬上限、子代理），以及離席流程。
 - 還沒實際觀察到的：在真實 session 中一路跑到 600k 的完整流程，以及閒置刷新是否真的能讓 1 小時快取延續。見[限制](#限制)。
 
 ## 快速開始
@@ -30,7 +42,7 @@ git clone https://github.com/cablate/ctx-handoff-mod ~/.claude/mods/ctx-handoff
 claude --plugin-dir ~/.claude/mods/ctx-handoff
 ```
 
-在 session 裡執行 `/handoff-status`，應該會看到類似：
+在 session 裡執行 `/handoff`，應該會看到類似：
 
 ```
 [ctx-handoff] context 12034 / 門檻 600000（視窗 1000000）
@@ -47,13 +59,19 @@ claude --plugin-dir ~/.claude/mods/ctx-handoff
 
 正常使用時用不到這些。
 
+只有一個指令 `/handoff`，用子指令區分。
+
 | 指令 | 用途 |
 |---|---|
-| `/handoff-status` | 查看 context 用量、門檻、刷新狀態，以及有沒有待處理的離席 handoff |
-| `/handoff-refresh on\|off` | 開關閒置時的快取刷新。關閉時，閒置 55 分鐘就直接存離席 handoff |
-| `/handoff-resume` | 使用離席 handoff：先 `/clear`，再送出 handoff 和剛才被攔下的訊息 |
-| `/handoff-continue` | 放棄離席 handoff，在原本的對話送出被攔下的訊息 |
-| `/handoff-now yes` | 立刻交接（會清除目前對話） |
+| `/handoff` | 查看 context 用量、門檻、刷新與背景整理狀態、有沒有待處理的離席 handoff，並列出用法 |
+| `/handoff now` | 立刻交接（會清除目前對話） |
+| `/handoff dry` | 試產一份 handoff 並顯示用量，不清除對話 |
+| `/handoff distill` | 立刻整理本專案的記憶與規則 |
+| `/handoff resume` | 使用離席 handoff：先 `/clear`，再送出 handoff 和剛才被攔下的訊息 |
+| `/handoff continue` | 放棄離席 handoff，在原本的對話送出被攔下的訊息 |
+| `/handoff resend` | 重新送出沒送達的 handoff（優先用這個 process 自己的紀錄，否則用它最近產生的那份）。不會 `/clear` |
+| `/handoff refresh on\|off` | 開關閒置時的快取刷新。關閉時，閒置 55 分鐘就直接存離席 handoff |
+| `/handoff distill on\|off` | 開關背景整理 |
 
 最近 5 份 handoff 會保存在 mod 的 store 裡。
 
@@ -73,11 +91,11 @@ claude --plugin-dir ~/.claude/mods/ctx-handoff
 
 ## 限制
 
-- **5 分鐘快取的使用者應關閉刷新。** 用 API key、Bedrock、Vertex，或訂閱已超出額度、開始扣 usage credits 時，prompt 快取只有 5 分鐘。這時第 55 分鐘的刷新會發現快取早就過期，而且每次刷新都會重寫整段 context。請執行 `/handoff-refresh off`。mod 不會自動偵測 TTL。
+- **5 分鐘快取的使用者應關閉刷新。** 用 API key、Bedrock、Vertex，或訂閱已超出額度、開始扣 usage credits 時，prompt 快取只有 5 分鐘。這時第 55 分鐘的刷新會發現快取早就過期，而且每次刷新都會重寫整段 context。請執行 `/handoff refresh off`。mod 不會自動偵測 TTL。
 - **閒置刷新還沒驗證。** 還不確定 fork 讀取快取時，能不能延長主對話那份 1 小時快取的時效。
-- **背景工作只能偵測一部分。** 背景 Bash 的 task id 是從結構化欄位讀的；Workflow 和 Monitor 的 task id 是從工具輸出文字裡抓的，格式還沒驗證。永遠不會結束的工作（例如 dev server）會讓交接一直延後，直到它的紀錄在 12 小時後作廢。需要時可以用 `/handoff-now yes` 強制交接。
-- **被攔下的訊息只保留文字。** 離席 handoff 後的第一則訊息如果附了圖片，只會帶上文字。攔下訊息這個行為本身沒有自動測試，因為測試環境模擬不了「使用者親手輸入的訊息」。
-- **熱重載會重置**計時器和背景工作的追蹤紀錄。
+- **背景工作的判斷靠 `Stop` hook 的快照。** 哪些 `status` 算「還在跑」、`Stop` 與 `turn.complete` 在真實 session 的先後，都還沒實測確認。永遠不會結束的工作（例如 dev server）只會讓交接延後到硬上限；需要時可以用 `/handoff now` 提早強制交接。
+- **被攔下的訊息只保留文字。** 交接期間或離席 handoff 後被攔下的訊息只會帶上文字，不含圖片。測試用 composer 來源的送出模擬使用者輸入，不是真實的終端機。
+- **熱重載會重置**計時器和記憶體內的狀態（攔下的訊息、排入的整理差異、重送紀錄）。
 - **API 還在 early access。** Claude Code 更新後可能需要跟著修改。
 
 ## 開發

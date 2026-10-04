@@ -12,13 +12,25 @@ All three paths apply to the main conversation only. Subagent turns are ignored.
 
 | When | What happens | You do |
 |---|---|---|
-| **A turn ends and context ≥ 600k** (or 80% of the window, whichever is lower) | Waits if background shells, workflows or subagents are still running. Otherwise it forks the conversation to write a handoff, then runs `/clear` and submits the handoff. The new conversation reports what it understood and waits for you. | Nothing |
+| **The main conversation stops and context ≥ 600k** (or 80% of the window, whichever is lower) | Decided when Claude Code's `Stop` hook fires. Waits if background tasks, one-shot scheduled wakeups or subagents are still running (recurring crons never block), up to a hard cap (below). Otherwise it forks the conversation to write a handoff (and distills memory in parallel), then runs `/clear` and submits the handoff. The new conversation reports what it understood and waits for you. | Nothing |
 | **You've been idle 55 minutes** | Forks a tiny request to refresh the prompt cache, up to 3 times (about 4 hours in total). At the 4th point it saves an "away handoff" and does **not** clear: you're not there, so it doesn't switch conversations on you. | Nothing |
-| **You come back after an away handoff** | Holds your first message and asks you to choose. | `/handoff-resume` starts a new conversation with the handoff and your message. `/handoff-continue` stays in the old one. |
+| **You come back after an away handoff** | Holds your first message and asks you to choose. | `/handoff resume` starts a new conversation with the handoff and your message. `/handoff continue` stays in the old one. Sending a different message instead continues the old conversation with both messages. If the old conversation moves on by itself (a turn finishes while nothing is held), the away handoff is discarded as stale. |
+
+### Behaviours worth knowing
+
+- **Messages typed during a handoff are not lost.** From the moment a threshold handoff or `/handoff now` starts until the handoff is submitted, your messages are dropped with a notice and held. Held messages are appended to the handoff text. One that arrives after that text was built is submitted right after the handoff turn. If the handoff fails before `/clear`, they are re-submitted in the old conversation. (Slash commands pass through, and `/handoff dry` and the away handoff never hold messages.)
+- **Background distill results ride on your next message.** The distilled changes are queued in memory and attached as extra context to the next prompt that really enters the conversation. Dropped prompts and slash commands do not consume them. The distill right before a handoff queues nothing.
+- **Distill output is JSONL, and the program applies it.** The background distill is still one tool-less fork (cache reuse). It writes one JSON action per line between `=== ACTIONS ===` and `=== END ===` (`add_memory`, `update_memory`, `delete_memory`, `add_rule`, `confirm_rule`, `update_rule`, `delete_rule`), always in Traditional Chinese (Taiwan) with code, commands, paths and error messages kept verbatim. The program validates every line (op, required string fields, `type` in user|feedback|project|reference, project and id exist); invalid lines are dropped, counted, and up to 3 truncated samples are kept and shown by `/handoff`. Any action with a secret-looking field is dropped whole, and its sample is not stored.
+- **Sessions that start in an outer folder still file notes per project.** Sessions often start in a parent folder (for example your home or a workspace folder) and touch several repos. The mod records, per session, the projects touched through tool paths (`file_path`, `path`, `notebook_path`) and the working directory for Bash: the nearest ancestor with a `.git`, otherwise the first-level child folder of the session root (`AppData` and dot folders skipped). The session root is `P1` (the default); touched projects are `P2`, `P3`, and so on (at most 8, oldest dropped). The distill prompt shows each project's memory and rules (`P1-M3`, `P2-R1`), asks the model to file each item under the project it belongs to (cross-project or unsure goes to `P1`), and writes each project's own `ctx-handoff.md`. If one project's file changed during the fork, only that file is skipped and the error names it. Changes from other projects are prefixed with the project name.
+- **First touch injects that project's notes.** The first time a session touches a project that already has a notes file, its notes ride on your next real prompt, once per project per session, in the same format as the new-conversation context. `P1` is never injected this way (it already arrives at the start of the conversation).
+- **Failures are visible and recoverable.** Every handoff failure (writing it, `/clear`, submitting) is recorded and shown by `/handoff`. After a failed threshold handoff the mod waits for 3 more user messages or 10 minutes before retrying. The full text is saved before `/clear` (as `pendingSubmit:<session id>`) and deleted only after the submit succeeds; if the submit fails, `/handoff resend` submits it again without another `/clear`.
+- **Store keys are per project.** Handoff history and distill status are kept per project, so `/handoff` shows only the current project. Per-session keys are pruned 30 days after they were first seen. The `refresh` and `distill` toggles stay global.
+- **Hand edits to the memory file survive.** Multi-line memory items, unknown `## ` sections and the rest of the file round-trip through a distill. A new rule whose name already exists is skipped. `/handoff` reports how many memory items are beyond the 40 that are injected.
+- **Hard cap on deferral.** If background work keeps the handoff waiting, it goes ahead anyway once context reaches `min(90% of the window, threshold + 150k)`, and the handoff intro says what was still running.
 
 Evidence so far:
 - The building blocks were checked live with a probe mod. `/clear` followed by `prompt.submit` works from a mod. A fork over a 102k-token conversation read 102,003 of 102,523 input tokens from cache (about 99.5%).
-- `claude plugin test`: 9/9 pass, covering the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, and deferral for a background shell, a background workflow and a running subagent.
+- `claude plugin test`: 69/69 pass, covering JSONL validation and rejection samples, per-project routing and touch detection, per-file skip during a fork, first-touch injection, the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, held messages during a handoff, context injection, per-project store keys and pruning, failure backoff and `/handoff resend`, memory-file round trip against a copy of a real file, `Stop`-based deferral (background task, one-shot cron, recurring cron, hard cap, subagent) and the away flow.
 - Not yet observed: a full real session reaching 600k, and whether an idle refresh actually keeps a 1-hour cache alive. See [Limitations](#limitations).
 
 ## Quick start
@@ -30,7 +42,7 @@ git clone https://github.com/cablate/ctx-handoff-mod ~/.claude/mods/ctx-handoff
 claude --plugin-dir ~/.claude/mods/ctx-handoff
 ```
 
-In the session, run `/handoff-status`. You should see something like:
+In the session, run `/handoff`. You should see something like:
 
 ```
 [ctx-handoff] context 12034 / 門檻 600000（視窗 1000000）
@@ -49,13 +61,19 @@ The mod's messages are in Traditional Chinese.
 
 You don't need these in the normal flow.
 
+There is one command, `/handoff`, with subcommands.
+
 | Command | Purpose |
 |---|---|
-| `/handoff-status` | Context use, threshold, refresh state, any pending away handoff |
-| `/handoff-refresh on\|off` | Turn idle cache refresh on or off. When off, the away handoff is saved after 55 idle minutes. |
-| `/handoff-resume` | Use the away handoff: `/clear`, then submit it, plus the message that was held |
-| `/handoff-continue` | Drop the away handoff and send the held message in the old conversation |
-| `/handoff-now yes` | Hand off right now (clears the conversation) |
+| `/handoff` | Context use, threshold, refresh and distill state, any pending away handoff, and usage |
+| `/handoff now` | Hand off right now (clears the conversation) |
+| `/handoff dry` | Produce a handoff and show its cost, without clearing |
+| `/handoff distill` | Distill this project's memory and rules now |
+| `/handoff resume` | Use the away handoff: `/clear`, then submit it, plus the message that was held |
+| `/handoff continue` | Drop the away handoff and send the held message in the old conversation |
+| `/handoff resend` | Submit a handoff that did not arrive (this process's own record, else the latest it generated). Does not `/clear` |
+| `/handoff refresh on\|off` | Turn idle cache refresh on or off. When off, the away handoff is saved after 55 idle minutes. |
+| `/handoff distill on\|off` | Turn background distilling on or off |
 
 The last 5 handoffs are kept in the mod's store.
 
@@ -75,11 +93,11 @@ On the threshold: community reports and Anthropic's own MRCR figures suggest qua
 
 ## Limitations
 
-- **5-minute cache users should turn refresh off.** API-key, Bedrock and Vertex users, and subscribers who are into usage credits, get a 5-minute prompt cache. For them a refresh at 55 minutes finds the cache already gone, and each refresh rewrites the whole context. Run `/handoff-refresh off`. The mod does not detect the TTL.
+- **5-minute cache users should turn refresh off.** API-key, Bedrock and Vertex users, and subscribers who are into usage credits, get a 5-minute prompt cache. For them a refresh at 55 minutes finds the cache already gone, and each refresh rewrites the whole context. Run `/handoff refresh off`. The mod does not detect the TTL.
 - **The idle refresh is unverified.** It is not yet confirmed that a fork's cache read extends the main conversation's 1-hour cache entry.
-- **Background-work detection is partial.** Background Bash is read from a structured field. Workflow and Monitor task IDs are parsed from tool output text, and that format is unverified. A task that never ends (a dev server) defers the handoff until its record expires after 12 hours. Use `/handoff-now yes` to force it.
-- **Held messages keep only their text.** If the first message after an away handoff has images, only the text is carried over. The hold itself has no automated test, because a test cannot simulate a typed message.
-- **Hot reloads reset the timers** and the background-task tracking.
+- **Background-work detection relies on the `Stop` hook's snapshot.** Which `status` values count as still running, and when `Stop` fires relative to `turn.complete`, are not yet confirmed in a real session. A task that never ends (a dev server) defers the handoff only until the hard cap; `/handoff now` forces it earlier.
+- **Held messages keep only their text.** A message held during a handoff or after an away handoff carries over its text only; images are not. Tests simulate typed messages with composer-origin submits, not a real terminal.
+- **Hot reloads reset the timers** and the in-memory state (held messages, queued distill notes, the resend record).
 - **The API is early access.** A Claude Code update may require changes.
 
 ## Development
