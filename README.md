@@ -2,9 +2,29 @@
 
 [繁體中文](README.zh-TW.md)
 
-A Claude Code mod that hands a long conversation over to a fresh one **automatically**: when the main conversation's context reaches a threshold, it writes a handoff summary, runs `/clear`, and submits the handoff so the new conversation picks up where you left off. While you are away it keeps the prompt cache warm, then saves a handoff instead of clearing. You type no commands in the normal flow.
+A Claude Code mod that hands a long conversation over to a fresh one **automatically**: when the main conversation's context reaches a threshold, it writes a handoff summary, runs `/clear`, and submits the handoff so the new conversation picks up where you left off. While you are away it keeps the prompt cache warm, then saves a handoff instead of clearing. It also distills what the conversation taught it into per-project notes in the background, and loads them into your next conversation. You type no commands in the normal flow.
 
 **Who it's for:** people who run long Claude Code sessions on a 1M-context model with a Claude subscription (1-hour prompt cache). **Status:** experimental. It is built on Claude Code's early-access function-hooks API, which may change between releases. Read [Limitations](#limitations) before relying on it.
+
+## Distill: stop saying the same thing a fourth time
+
+<img src="docs/distill-demo.gif" width="300" alt="Distill demo: the user repeats the same instruction three times and a fresh conversation forgets it; ctx-handoff distills it into a rule in the notes file, and the next conversation remembers">
+
+([Full-quality MP4](docs/distill-demo.mp4). The demo text is in Traditional Chinese.)
+
+What you corrected or explained in one conversation is usually gone in the next. While the cache is still warm, distill reads the conversation with one tool-less fork and keeps what is worth keeping as two kinds of items:
+
+| Item | What it holds | Example |
+|---|---|---|
+| **Memory** | Your preferences, the project's current state, where external resources live | "Lead with the conclusion", "Staging is at …" |
+| **Rule** | A reusable practice with a count of how often it came up; rules seen 2+ times load into new conversations, sorted by count | "Use forward slashes in Bash paths (3 times)" |
+
+- **It doesn't interrupt you.** Distill runs in the background, and its result rides on your next message, so the current conversation benefits right away.
+- **It costs almost no extra tokens.** The fork reuses the main conversation's cache (about 99.5% read from cache, measured).
+- **Notes are filed per project.** A session started in your home folder that touches several repos writes each item to the `ctx-handoff.md` of the project it belongs to. Notes load at the start of a new conversation, or the first time a session touches that project.
+- **The file is yours.** The notes file is plain Markdown. Edit it directly; your edits are preserved.
+
+Run `/handoff distill` to distill right now, or `/handoff distill off` to turn it off.
 
 ## What it does
 
@@ -31,7 +51,8 @@ All three paths apply to the main conversation only. Subagent turns are ignored.
 Evidence so far:
 - The building blocks were checked live with a probe mod. `/clear` followed by `prompt.submit` works from a mod. A fork over a 102k-token conversation read 102,003 of 102,523 input tokens from cache (about 99.5%).
 - `claude plugin test`: 69/69 pass, covering JSONL validation and rejection samples, per-project routing and touch detection, per-file skip during a fork, first-touch injection, the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, held messages during a handoff, context injection, per-project store keys and pruning, failure backoff and `/handoff resend`, memory-file round trip against a copy of a real file, `Stop`-based deferral (background task, one-shot cron, recurring cron, hard cap, subagent) and the away flow.
-- Not yet observed: a full real session reaching 600k, and whether an idle refresh actually keeps a 1-hour cache alive. See [Limitations](#limitations).
+- Confirmed live (2026-10-04): distill writes JSONL and Traditional Chinese notes; the distilled changes ride on the next message and the model sees them; a session started in the home folder files memory into the matching repo's notes; messages held during a handoff arrive appended to the new conversation's first message; past the hard cap, the handoff goes ahead even with background tasks and subagents running.
+- Not yet observed: whether an idle refresh actually keeps a 1-hour cache alive. See [Limitations](#limitations).
 
 ## Quick start
 
@@ -96,6 +117,7 @@ On the threshold: community reports and Anthropic's own MRCR figures suggest qua
 - **5-minute cache users should turn refresh off.** API-key, Bedrock and Vertex users, and subscribers who are into usage credits, get a 5-minute prompt cache. For them a refresh at 55 minutes finds the cache already gone, and each refresh rewrites the whole context. Run `/handoff refresh off`. The mod does not detect the TTL.
 - **The idle refresh is unverified.** It is not yet confirmed that a fork's cache read extends the main conversation's 1-hour cache entry.
 - **Background-work detection relies on the `Stop` hook's snapshot.** Which `status` values count as still running, and when `Stop` fires relative to `turn.complete`, are not yet confirmed in a real session. A task that never ends (a dev server) defers the handoff only until the hard cap; `/handoff now` forces it earlier.
+- **Handoffs at large context take longer.** The last distill runs alongside the handoff, and the handoff waits for both. Measured distill time: about 95 seconds at 476k, about 3 minutes at 800k (the handoff itself takes about 28 seconds at 800k). Your messages are held during that time.
 - **Held messages keep only their text.** A message held during a handoff or after an away handoff carries over its text only; images are not. Tests simulate typed messages with composer-origin submits, not a real terminal.
 - **Hot reloads reset the timers** and the in-memory state (held messages, queued distill notes, the resend record).
 - **The API is early access.** A Claude Code update may require changes.
