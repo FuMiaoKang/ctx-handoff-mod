@@ -12,7 +12,7 @@ A Claude Code mod that hands a long conversation over to a fresh one **automatic
 
 ([Full-quality MP4](docs/distill-demo.mp4). The demo text is in Traditional Chinese.)
 
-What you corrected or explained in one conversation is usually gone in the next. While the cache is still warm, distill reads the conversation with one tool-less fork and keeps what is worth keeping as two kinds of items:
+What you corrected or explained in one conversation is usually gone in the next. Distill sends only the part of the conversation since its last run to a small model (Sonnet 5.5 at low effort) in one tool-less request, and keeps what is worth keeping as two kinds of items:
 
 | Item | What it holds | Example |
 |---|---|---|
@@ -20,7 +20,7 @@ What you corrected or explained in one conversation is usually gone in the next.
 | **Rule** | A reusable practice with a count of how often it came up; rules seen 2+ times load into new conversations, sorted by count | "Use forward slashes in Bash paths (3 times)" |
 
 - **It doesn't interrupt you.** Distill runs in the background, and its result rides on your next message, so the current conversation benefits right away.
-- **It costs almost no extra tokens.** The fork reuses the main conversation's cache (about 99.5% read from cache, measured).
+- **Each run is one small request.** Only the new part of the conversation is sent (tool inputs and results are clipped, and the total is capped), to Sonnet 5.5 at low effort, so the cost does not grow with the whole context or depend on the prompt cache still being warm.
 - **Notes are filed per project.** A session started in your home folder that touches several repos writes each item to the `ctx-handoff.md` of the project it belongs to. Notes load at the start of a new conversation, or the first time a session touches that project.
 - **The file is yours.** The notes file is plain Markdown. Edit it directly; your edits are preserved.
 
@@ -40,7 +40,7 @@ All three paths apply to the main conversation only. Subagent turns are ignored.
 
 - **Messages typed during a handoff are not lost.** From the moment a threshold handoff or `/handoff now` starts until the handoff is submitted, your messages are dropped with a notice and held. The notice says how long the handoff has been running (usually under a minute, at most about 3 minutes). Sending the same text again holds it only once. Only text can be held: images and other attachments must be pasted again after the handoff, and the notice says so. Held messages are appended to the handoff text. One that arrives after that text was built is submitted right after the handoff turn. If the handoff fails before `/clear`, they are re-submitted in the old conversation. (Slash commands pass through, and `/handoff dry` and the away handoff never hold messages.)
 - **Background distill results ride on your next message.** The distilled changes are queued in memory and attached as extra context to the next prompt that really enters the conversation. Dropped prompts and slash commands do not consume them. When a distill changes anything, a toast shows how many items changed and the full path of every notes file it wrote; nothing is sent to the model until your next message. The distill right before a handoff queues nothing.
-- **Distill output is JSONL, and the program applies it.** The background distill is still one tool-less fork (cache reuse). It writes one JSON action per line between `=== ACTIONS ===` and `=== END ===` (`add_memory`, `update_memory`, `delete_memory`, `add_rule`, `confirm_rule`, `update_rule`, `delete_rule`, and `move_memory` / `move_rule`, which move an item to another project in one step so it cannot be lost halfway), always in Traditional Chinese (Taiwan) with code, commands, paths and error messages kept verbatim. The program validates every line (op, required string fields, `type` in user|feedback|project|reference, project and id exist); invalid lines are dropped, counted, and up to 3 samples are kept and shown by `/handoff`, each with the reason (bad JSON, missing field, unknown project or id, and so on) and the head and tail of the line. Any action with a secret-looking field is dropped whole, and its sample is not stored.
+- **Distill output is JSONL, and the program applies it.** The background distill is one tool-less request to `DISTILL_MODEL`. It writes one JSON action per line between `=== ACTIONS ===` and `=== END ===` (`add_memory`, `update_memory`, `delete_memory`, `add_rule`, `confirm_rule`, `update_rule`, `delete_rule`, and `move_memory` / `move_rule`, which move an item to another project in one step so it cannot be lost halfway), always in Traditional Chinese (Taiwan) with code, commands, paths and error messages kept verbatim. The program validates every line (op, required string fields, `type` in user|feedback|project|reference, project and id exist); invalid lines are dropped, counted, and up to 3 samples are kept and shown by `/handoff`, each with the reason (bad JSON, missing field, unknown project or id, and so on) and the head and tail of the line. Any action with a secret-looking field is dropped whole, and its sample is not stored.
 - **Sessions that start in an outer folder still file notes per project.** Sessions often start in a parent folder (for example your home or a workspace folder) and touch several repos. The mod records, per session, the projects touched through tool paths (`file_path`, `path`, `notebook_path`) and the working directory for Bash: the nearest ancestor with a `.git`, otherwise the first-level child folder of the session root (`AppData` and dot folders skipped). The session root is `P1` (the default), taken from where the session started, so a Bash `cd` into another repo does not move it (a session started in a git worktree uses the main working tree's notes); touched projects are `P2`, `P3`, and so on (at most 8, oldest dropped), and a touched git worktree counts as its main working tree. Other projects that already have notes follow, listed only by the first 60 characters of each item (at most 8); the model may add to them or move items into them, but not edit their items. That way work done only through MCP tools or the web, which leaves no file path, still lands in the right project. The distill prompt shows each project's memory and rules (`P1-M3`, `P2-R1`), asks the model to file each item by its topic rather than by which files were touched (cross-project or truly unclear goes to `P1`), and writes each project's own `ctx-handoff.md`. If one project's file changed during the fork, only that file is skipped and the error names it; a move to or from that file is skipped as well. Changes from other projects are prefixed with the project name.
 - **First touch injects that project's notes.** The first time a session touches a project that already has a notes file, its notes ride on your next real prompt, once per project per session, in the same format as the new-conversation context. `P1` is never injected this way (it already arrives at the start of the conversation).
 - **Failures are visible and recoverable.** Every handoff failure (writing it, `/clear`, submitting) is recorded and shown by `/handoff`. A handoff fork that has not answered in 3 minutes is abandoned, and held messages go back to the old conversation; a distill fork is abandoned after 8 minutes. If `/clear` fails during `/handoff resume`, the away handoff and your held message are kept so you can choose again. After a failed threshold handoff the mod waits for 3 more user messages or 10 minutes before retrying. The full text is saved before `/clear` (as `pendingSubmit:<session id>`) and deleted only after the submit succeeds; if the submit fails, `/handoff resend` submits it again without another `/clear`.
@@ -50,7 +50,7 @@ All three paths apply to the main conversation only. Subagent turns are ignored.
 
 Evidence so far:
 - The building blocks were checked live with a probe mod. `/clear` followed by `prompt.submit` works from a mod. A fork over a 102k-token conversation read 102,003 of 102,523 input tokens from cache (about 99.5%).
-- `claude plugin test`: 97/97 pass, covering JSONL validation and rejection samples with reasons, moves between projects (including a skipped destination), a touched worktree filed under its main tree, a worktree session whose main tree has no notes yet, known-but-untouched projects (add allowed, edits rejected, temp folders skipped), fork timeouts, the 60-second wait for the last distill, held-message dedupe and attachments, a Bash `cd` not moving `P1`, a git worktree using the main tree's notes, escaped secrets never stored, a failed write during a move, `/clear` failing during resume, per-project routing and touch detection, per-file skip during a fork, first-touch injection, the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, held messages during a handoff, context injection, per-project store keys and pruning, failure backoff and `/handoff resend`, memory-file round trip against a copy of a real file, `Stop`-based deferral (background task, one-shot cron, recurring cron, hard cap, subagent) and the away flow.
+- `claude plugin test`: 98/98 pass, covering distill through `model.complete` with only the slice after the last anchor, `/handoff` taken by a user skill, JSONL validation and rejection samples with reasons, moves between projects (including a skipped destination), a touched worktree filed under its main tree, a worktree session whose main tree has no notes yet, known-but-untouched projects (add allowed, edits rejected, temp folders skipped), fork timeouts, the 60-second wait for the last distill, held-message dedupe and attachments, a Bash `cd` not moving `P1`, a git worktree using the main tree's notes, escaped secrets never stored, a failed write during a move, `/clear` failing during resume, per-project routing and touch detection, per-file skip during a fork, first-touch injection, the threshold, a 200k window, refresh then away handoff, refresh off, small-context skip, resume, held messages during a handoff, context injection, per-project store keys and pruning, failure backoff and `/handoff resend`, memory-file round trip against a copy of a real file, `Stop`-based deferral (background task, one-shot cron, recurring cron, hard cap, subagent) and the away flow.
 - Confirmed live (2026-10-04): distill writes JSONL and Traditional Chinese notes; the distilled changes ride on the next message and the model sees them; a session started in the home folder files memory into the matching repo's notes; messages held during a handoff arrive appended to the new conversation's first message; past the hard cap, the handoff goes ahead even with background tasks and subagents running.
 - Not yet observed: whether an idle refresh actually keeps a 1-hour cache alive. See [Limitations](#limitations).
 
@@ -82,7 +82,7 @@ The mod's messages are in Traditional Chinese.
 
 You don't need these in the normal flow.
 
-There is one command, `/handoff`, with subcommands.
+There is one command, `/handoff`, with subcommands. If your own command or skill already uses `/handoff`, the mod registers `/ctx-handoff` instead.
 
 | Command | Purpose |
 |---|---|
@@ -109,6 +109,7 @@ The values are constants at the top of [`hooks/register.ts`](hooks/register.ts).
 | `IDLE_MS` | 55 min | Idle time before a refresh (tuned for a 1-hour cache) |
 | `MAX_REFRESH` | `3` | Refreshes before the away handoff |
 | `MIN_TOKENS` | `30_000` | Below this, skip refresh and the away handoff |
+| `DISTILL_MODEL` | `claude-sonnet-5-5` | Model for distill (with `DISTILL_EFFORT` `low`); only the conversation since the last distill is sent |
 
 On the threshold: community reports and Anthropic's own MRCR figures suggest quality starts slipping somewhere around 200k–300k tokens. 600k is a deliberate choice to hand off less often. Lower it if you notice the model getting worse before the handoff fires.
 
@@ -117,17 +118,20 @@ On the threshold: community reports and Anthropic's own MRCR figures suggest qua
 - **5-minute cache users should turn refresh off.** API-key, Bedrock and Vertex users, and subscribers who are into usage credits, get a 5-minute prompt cache. For them a refresh at 55 minutes finds the cache already gone, and each refresh rewrites the whole context. Run `/handoff refresh off`. The mod does not detect the TTL.
 - **The idle refresh is unverified.** It is not yet confirmed that a fork's cache read extends the main conversation's 1-hour cache entry.
 - **Background-work detection relies on the `Stop` hook's snapshot.** Which `status` values count as still running, and when `Stop` fires relative to `turn.complete`, are not yet confirmed in a real session. A task that never ends (a dev server) defers the handoff only until the hard cap; `/handoff now` forces it earlier.
-- **The last distill may not finish at large context.** Distill takes about 95 seconds at 476k and about 3 minutes at 800k (the handoff itself about 28 seconds at 800k), so the handoff no longer waits for it past 60 seconds. Whether `/clear` lets that in-flight fork finish is not yet confirmed live; if it does not, that distill is recorded as failed and the end of the old conversation is not distilled.
+- **The last distill runs across `/clear`.** It reads its slice of the conversation first, so the handoff waits at most 5 seconds for it and then clears. Whether `/clear` lets that in-flight request finish is not yet confirmed live; if it does not, that distill is recorded as failed and `/handoff` shows it.
 - **Held messages keep only their text.** A mod sees an attachment's kind, never its bytes, so images sent during a handoff or after an away handoff must be pasted again; the notice says so. Tests simulate typed messages with composer-origin submits, not a real terminal.
 - **Hot reloads reset the timers** and the in-memory state (held messages, queued distill notes, the resend record).
 - **The API is early access.** A Claude Code update may require changes.
 
 ## Development
 
+See [`CLAUDE.md`](CLAUDE.md) for the workflow, design decisions and tested platform facts, and [`tools/README.md`](tools/README.md) for the scripts.
+
 ```sh
-claude plugin validate .
-claude plugin test .
-tsc -p .   # after the mod has loaded once, which writes .claude-plugin/types/
+node tools/wt.mjs new <branch>    # edit in a temporary worktree, not the hot-reloaded folder
+node tools/check.mjs              # validate, tests, tsc, public-info scan
+node tools/wt.mjs land <branch>   # check again, then fast-forward the main folder
+node tools/status.mjs             # notes sizes, last distill and failures, reloads per session
 ```
 
 ## License

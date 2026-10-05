@@ -17,6 +17,10 @@ const DISTILL_REPLY = actionsReply(
 )
 let distillReply = DISTILL_REPLY
 let onFork: (() => void | Promise<void>) | undefined
+// 整理請求回 aborted（引擎依 timeoutMs 放棄）
+let completeAborts = false
+let takenCommands = new Set<string>()
+let registered: string[] = []
 // 每個 fork 都會等它：用來讓 fork 停在半空中，測試並行與交接期間的行為
 let forkGate: (() => Promise<void>) | undefined
 // 只擋整理 fork／只擋交接 fork
@@ -43,6 +47,8 @@ let curCwd = 'C:/proj'
 const world = (on: On, tokens: number, window = 1_000_000, store: Record<string, unknown> = {}, agents: { id: string; status: string }[] = [], turns: number | (() => number) = 0) => {
   const turnsOf = typeof turns === 'function' ? turns : () => turns
   const forks: string[] = []
+  const completes: { model: string; effort?: string; system?: string; prompt: string; timeoutMs?: number }[] = []
+  const rows: { role: 'user' | 'assistant'; text: string; toolUses: { tool: string; input: Record<string, unknown>; text?: string }[] }[] = []
   const commands: string[] = []
   const submits: string[] = []
   const contexts: (readonly string[] | undefined)[] = []
@@ -51,6 +57,9 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
   const logs: string[] = []
   distillReply = DISTILL_REPLY
   onFork = undefined
+  completeAborts = false
+  takenCommands = new Set()
+  registered = []
   forkGate = undefined
   distillGate = undefined
   handoffGate = undefined
@@ -117,7 +126,24 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
     const text = isDistill ? distillReply : 'HANDOFF: 測試'
     return { value: { isAnswered: true as const, text, usage: usage(tokens) } }
   })
-  on('command.register', (_$, e: { name: string }) => ({ value: { command: e.name } }))
+  // 背景整理走 model.complete：記進同一個 forks 清單（系統提示＋訊息），測試照舊比對內容與次數
+  on('model.complete', async (_$, e: { model: string; effort?: string; system?: string; prompt: string; timeoutMs?: number }) => {
+    completes.push(e)
+    forks.push(`${e.system ?? ''}\n${e.prompt}`)
+    // timeoutMs 由引擎計時；completeAborts 模擬到時回 aborted
+    if (completeAborts) return { value: { isAnswered: false as const, reason: 'aborted' as const, usage: usage(0) } }
+    await onFork?.()
+    await forkGate?.()
+    await distillGate?.()
+    return { value: { isAnswered: true as const, text: distillReply, usage: usage(0) } }
+  })
+  // 主對話的訊息：送進對話的人類訊息依序當成使用者訊息，另外可以塞助理訊息
+  on('session.messages', () => ({ value: [...rows] as never }))
+  // takenCommands：已被使用者自己的指令或 skill 佔用的名稱
+  on('command.register', (_$, e: { name: string }) => {
+    registered.push(e.name)
+    return takenCommands.has(e.name) ? { deny: `"/${e.name}" refused: it is the user's /${e.name}` } : { value: { command: e.name } }
+  })
   on('session.start', (_$, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('prompt.context', (_$, e) => ({ blocks: [...e.blocks] }))
   on('command.run', async (_$, e: { command: string }) => {
@@ -127,15 +153,16 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
   })
   on('turn.complete', () => ({ text: '' }))
   on('classic.Stop', () => (stopBlock !== undefined ? { block: stopBlock } : {}))
-  on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', type: 'general-purpose' })) }))
+  on('agent.list', () => ({ value: agents.map(a => ({ ...a, description: '', type: 'general-purpose' })) as never }))
   on('prompt.submit', (_$, e: { text?: string; context?: readonly string[] }) => {
     // 送不進對話：被丟棄（hook 丟例外只會被引擎略過，不會讓 $.prompt.submit 失敗）
     if (failSubmits > 0) { failSubmits -= 1; return { drop: 'submit boom' } }
     submits.push(e.text ?? '')
     contexts.push(e.context)
+    rows.push({ role: 'user', text: e.text ?? '', toolUses: [] })
     return { text: e.text ?? '', context: e.context }
   })
-  return { clock, forks, commands, submits, contexts, toasts, files, logs, get, put, writes }
+  return { clock, forks, commands, submits, contexts, toasts, files, logs, get, put, writes, completes, rows }
 }
 
 const NOTE_TAG = '[ctx-handoff 專案經驗]'
@@ -266,8 +293,12 @@ test('閒置刷新順便整理：寫入專案經驗檔、濾掉疑似金鑰、�
   await $.prompt.submit({ text: '請幫我  整理\n這段對話', origin: composer, wait: false })
   await endTurn($)
   await w.clock.advance(55 * 60_000)
-  expect(w.forks.length).toBe(1)
-  expect(w.forks[0]).toContain('範圍：整段對話')
+  // 刷新是只回 OK 的 fork，整理是另一個 complete 請求，附上這段對話
+  expect(w.forks.length).toBe(2)
+  expect(w.forks[0]).toBe('只回覆 OK')
+  expect(w.forks[1]).toContain('範圍：整段對話')
+  expect(w.forks[1]).toContain('【使用者】請幫我  整理\n這段對話')
+  expect(w.completes[0]).toMatchObject({ model: 'claude-sonnet-5-5', effort: 'low' })
   const notes = w.files.get(NOTES) ?? ''
   expect(notes).toContain('## 記憶\n- [project] 使用者決定交接門檻維持 600k')
   expect(notes).not.toContain('api_key')
@@ -277,7 +308,7 @@ test('閒置刷新順便整理：寫入專案經驗檔、濾掉疑似金鑰、�
   expect(status.text).toContain('新增記憶：[project] 使用者決定交接門檻維持 600k')
   // 第二次刷新：沒有新訊息，只回 OK
   await w.clock.advance(55 * 60_000)
-  expect(w.forks[1]).toBe('只回覆 OK')
+  expect(w.forks.slice(2)).toEqual(['只回覆 OK'])
   // 差異不用 session.append，而是跟著下一則送進對話的訊息
   await say($, '下一則')
   expect(w.contexts[1]?.[0]).toContain(NOTE_TAG)
@@ -325,8 +356,17 @@ test('依編號套用新增／更新／刪除／確認，超出範圍的忽略�
     { op: 'confirm_rule', id: 'P1-R9', evidence: '超出範圍' },
     { op: 'add_rule', name: '沒有規則內容的條目', evidence: '缺規則，應丟棄' },
   )
+  w.rows.push(
+    { role: 'user', text: '更早的訊息', toolUses: [] },
+    { role: 'user', text: '上次最後一則訊息', toolUses: [] },
+    { role: 'assistant', text: '好的', toolUses: [{ tool: 'Bash', input: { command: 'ls' }, text: 'a.ts' }] },
+  )
   await distillNow($)
   expect(w.forks[0]).toContain('使用者說「上次最後一則訊息」')
+  // 只附上錨點之後的對話；工具呼叫留名稱、輸入與結果
+  expect(w.forks[0]).toContain('【助理】好的')
+  expect(w.forks[0]).toContain('〔工具 Bash〕{"command":"ls"} → a.ts')
+  expect(w.forks[0]).not.toContain('更早的訊息')
   expect(w.forks[0]).toContain('P1-M1 [feedback] 舊 A')
   expect(w.forks[0]).toContain('P1-R2 規則二｜出現 2 次｜做 Y')
   const notes = w.files.get(NOTES) ?? ''
@@ -563,6 +603,16 @@ test('S5 session.start：舊的全域 handoffs 只搬屬於這個專案的，一
   expect(w.get('migrated:C--proj')).toBe(true)
   await startSession($)
   expect(w.get('handoffs:C--proj')).toEqual([old[0]])
+})
+
+test('使用者已有 /handoff：改註冊 /ctx-handoff，指令照常可用，啟動時的整理照跑', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, { handoffs: [saved('present', 1)] })
+  takenCommands = new Set(['handoff'])
+  await startSession($)
+  expect(registered).toEqual(['handoff', 'ctx-handoff'])
+  expect(w.get('migrated:C--proj')).toBe(true)
+  const r = await $.command.run({ command: 'ctx-handoff', args: '', origin: composer, presentation })
+  expect(r.text).toContain('背景整理')
 })
 
 const staleAway = { handoff: 'H', held: '攔下的訊息' }
@@ -1086,7 +1136,8 @@ test('碰過的專案：根目錄底下的單一檔案、不存在的子資料�
   dir(w, 'C:/proj/api')
   await $.tool.call({ tool: 'Grep', pattern: 'x', path: 'C:/proj/notes.txt' })
   await read($, 'C:/proj/ghost/a.ts')
-  await $.tool.call({ tool: 'mcp__x__search', path: 'notes/today' })
+  // MCP 工具不在內建工具的型別清單裡
+  await $.tool.call({ tool: 'mcp__x__search', path: 'notes/today' } as never)
   await read($, 'C:/proj/web/../api/x.ts')
   await distillNow($)
   expect(projectsIn(w.forks[0] ?? '')).toEqual(['P1 C:/proj（預設：session 啟動資料夾）', 'P2 C:/proj/api'])
@@ -1228,14 +1279,14 @@ test('交接 fork 卡住：3 分鐘後放棄並記錄，攔下的訊息送回舊
   expect(w.submits.at(-1)).toBe('之後的訊息')
 })
 
-test('交接前整理很慢：handoff 好了，從交接開始最多等 60 秒就 /clear；整理之後照樣寫檔、不排入', async ($, on) => {
+test('交接前整理很慢：handoff 好了，從交接開始最多等 5 秒就 /clear；整理之後照樣寫檔、不排入', async ($, on) => {
   const w = world(on, 650_000, 1_000_000, {}, [], 5)
   const g = gate()
   distillGate = g.wait
   await stop($)
   await w.clock.advance(0)
   expect(w.commands).toEqual([])
-  await w.clock.advance(59_000)
+  await w.clock.advance(4_000)
   expect(w.commands).toEqual([])
   await w.clock.advance(1_000)
   expect(w.commands).toEqual(['clear'])
@@ -1247,16 +1298,14 @@ test('交接前整理很慢：handoff 好了，從交接開始最多等 60 秒�
   expect(w.contexts.at(-1)).toBeUndefined()
 })
 
-test('整理 fork 卡住：8 分鐘後放棄並記錄，之後的整理不會被擋住', async ($, on) => {
+test('整理請求逾時：時限 8 分鐘交給引擎，回 aborted 就記錄，之後的整理不會被擋住', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  distillGate = hang
-  const first = distillNow($)
-  await w.clock.advance(0)
-  await w.clock.advance(8 * 60_000)
-  await first
+  completeAborts = true
+  await distillNow($)
+  expect(w.completes[0]?.timeoutMs).toBe(8 * 60_000)
   const err = w.get('distill:error:C--proj') as { reason: string }
   expect(err.reason).toContain('timeout')
-  distillGate = undefined
+  completeAborts = false
   await distillNow($)
   expect(w.files.get(NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
 })

@@ -1,0 +1,53 @@
+# ctx-handoff 開發指引
+
+給在這個 repo 工作的 AI 與開發者。使用說明在 `README.md`／`README.zh-TW.md`；本檔只寫改程式時要知道的事。
+
+## 開發流程
+
+mod 用 `CLAUDE_CODE_PLUGIN_DIRS` 載入時，主資料夾的檔案一變，所有開著的 session 立刻熱重載，可能跑到改到一半的程式。所以一律在暫存 worktree 改：
+
+```
+node tools/wt.mjs new <分支>      # 建 worktree、複製型別檔
+# 在 worktree 改程式、補測試、git commit
+node tools/wt.mjs land <分支>     # 跑 tools/check.mjs，通過才 fast-forward 回主資料夾
+node tools/status.mjs             # 確認各 session 已熱重載、看整理與失敗紀錄
+```
+
+- 推送前一定跑 `node tools/check.mjs`：plugin validate、plugin test、tsc、公開資訊掃描（`<git 共用目錄>/info/private-words` 放不能出現在公開 repo 的詞，不進版本控制）。
+- 每個真的發生過的事故，補一個在舊程式上會失敗的固定測試。
+- 改經驗檔用 `node tools/notes.mjs`（以條目為單位、預設預演），不要手寫一次性腳本。工具一覽在 `tools/README.md`。
+
+## 設計決定（改之前先讀）
+
+- **整理用不帶歷史的單次請求**：`$.model.complete`（`DISTILL_MODEL`，effort low），只送上次錨點之後的對話片段（`$.session.messages()` 轉成純文字，工具輸入／結果截短，總長有上限），由程式驗證 JSONL 動作再寫檔。整理一開始就讀好片段，所以交接只等幾秒就能 `/clear`。不要改回 fork：fork 一定用主模型、整段前綴，快取一過期就全價重送。
+- **交接仍用 `$.model.fork`**：handoff 需要整段 context。fork 沒有工具、沒有取消參數，時限只能用 `$.clock.after`＋`Promise.race`（原本的 fork 仍在背景跑完）。
+- **不自動送訊息通知 AI**：會多一次整段 context 的請求，離席時也會讓離席 handoff 被當成過時刪掉。整理有變動只跳 toast（寫完整路徑），差異用 `prompt.submit` 的 `context` 跟著下一則人類訊息帶入；不用 `session.append`（會插進進行中的回合）。
+- **經驗檔是各專案自己的工作紀錄**：`<claude>/projects/<專案>/memory/ctx-handoff.md`，不寫 `MEMORY.md`（內建 auto memory 開啟時會重複載入或改寫）。P1 是 session 啟動資料夾，依 `$.session.root()` 判斷（`$.session.repo()` 會跟著 Bash `cd` 變）；worktree 一律對到主工作樹。
+- **跨檔搬移兩階段寫入**：第一階段只寫「目的地原本內容＋搬入條目」，第二階段寫所有檔案最終版本，第一階段寫過的檔一律重寫；任一步失敗，條目至少還在一份檔案裡。改這段要用逐位置注入寫入失敗驗證。
+- **背景失敗原因寫進 `$.store`** 並在 `/handoff` 狀態顯示：`$.ui.log` 在 `/clear` 之後不會留在對話檔。手動指令沒有回答時不要回報「完成」。
+- **指令名稱**：`/handoff` 被使用者自己的指令或 skill 佔用時，改註冊 `/ctx-handoff`。
+
+## 平台事實（實測過）
+
+| 主題 | 事實 |
+|---|---|
+| `$.model.fork` | 沒有工具；這個 process 還沒有主對話回應時回 `nothing-to-fork`（新 session 第一次請求前、`/clear` 之後、process 重啟接續同一 session）。結果的 `aborted` 只在發起 fork 的回合被中斷時出現 |
+| fork 子代理 | `$.agent.spawn({ subagentType: 'fork' })` 有工具，第一個請求快取命中約 99%，但每次工具呼叫都重讀整個前綴；`model` 參數對它無效 |
+| 快取與換模型 | `turn.step` 改 model 或 effort 會讓 prompt cache 失效。對繼承主對話快取的請求換模型前，先比較「原模型讀快取（約 0.1 倍輸入價）× 前綴」與「新模型輸入價 × 前綴＋寫快取」 |
+| 權限攔截 | 從指令 handler spawn 的子代理，`tool.call`／`turn.step` 攔得到；從 `$.clock.after` 計時器 spawn 的完全攔不到。用 hook 限權時每條啟動路徑都要實測 |
+| `turn.step` | 串流 hook：`async function* ($, e, next) { const r = yield* next(e); …; return r }`，用量在 `r.usage` |
+| `prompt.context` | 每段對話只在第一則訊息觸發一次（compaction、`/clear` 或 `$.ui.invalidate("prompt.context")` 才重算） |
+| `prompt.submit` | `attachments` 只有 `type`、`mediaType`、`filename`，沒有內容，mod 不能暫存或重送圖片 |
+| `$.store` | 所有 session 與 process 共用一個 JSON 檔（`<claude>/plugins/store/ctx-handoff_*.json`），鍵要依專案或 session 分開 |
+| `$.fs.write` | 會自動建立上層目錄 |
+| 時區 | 執行環境有本地時區：`toLocaleString` 是本地、`toISOString` 是 UTC |
+| 熱重載 | 對話檔留下 `ctx-handoff: reloaded (N hooks: …)`；會清掉模組變數（攔下的訊息、排入的差異、計時器），閒置中的 session 要等下一個回合結束才重新排計時器 |
+| 耗時 | handoff fork 在 800k context 約 28 秒 |
+
+## 測試引擎的限制
+
+- 同一個 hook 在一個測試裡只能註冊一次（`registered twice`），第一次呼叫 `$` 之後不能再 `on()`；要測多種情況就在頂層用 `for (…) test(…)` 展開。
+- `mock.clock` 從 0 開始，不能拿 0 當「尚未開始」的哨兵值。
+- 沒有 `session.append` 的實作；`classic.Stop` 與 `turn.complete` 只在測試主動觸發時才跑、沒有先後，這些要靠實機驗證。
+- mock 收不到事件時，先另寫一個暫時的 `*.test.ts`，分別從測試的 `$` 直接呼叫與經由 plugin 呼叫，確認引擎行為再改測試。
+- 要用沒實測過的 API（spawn、串流 hook、權限攔截）時，先做一個獨立的探測 mod，把逐步數據寫進 `$.store` 再分析，確認後才改這個 mod。
