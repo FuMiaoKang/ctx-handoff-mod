@@ -1178,7 +1178,7 @@ test('整理提示：有繁體中文指示、專案清單、每個專案各自�
   expect(p).toContain('一律用繁體中文（台灣）撰寫；程式碼、指令、路徑、錯誤訊息與專有名詞維持原文')
   expect(p).toContain('P1 C:/proj（預設：session 啟動資料夾）')
   expect(p).toContain(`P2 ${ALPHA}`)
-  expect(p).toContain('每條都要判斷屬於哪個專案：只屬於某個 repo 的經驗放到那個專案，跨專案通用或不確定的放 P1')
+  expect(p).toContain('每條都要判斷屬於哪個專案：看內容的主題（產品、服務、repo、路徑），不是看這次碰了哪些檔案')
   expect(p).toContain('P1-M2 [project] 舊 B')
   expect(p).toContain('P1-R1 規則一｜出現 1 次｜做 X')
   expect(p).toContain('P2-M1 [user] alpha 的記憶')
@@ -1529,4 +1529,50 @@ test('整理有變動：跳出提示，寫出項數與每份經驗檔的完整�
   const before = w.toasts.length
   await distillNow($)
   expect(w.toasts.slice(before).some(t => t.includes('經驗已更新'))).toBe(false)
+})
+
+// 2026-10-05 實例：家目錄 session 碰了別的 repo 的 worktree，worktree 長出自己的經驗檔
+test('碰到別的 repo 的 worktree：經驗寫到主工作樹那個專案', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  const WT = 'D:/repos/alpha-feat'
+  w.files.set(`${WT}/.git`, 'gitdir: D:/repos/alpha/.git/worktrees/alpha-feat\n')
+  repo(w, ALPHA)
+  await read($, `${WT}/a.ts`)
+  distillReply = actionsReply({ op: 'add_memory', project: 'P2', type: 'project', text: 'worktree 裡學到的事' })
+  await distillNow($)
+  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('worktree 裡學到的事')
+  expect(w.files.has(`${CLAUDE_PROJECTS}/D--repos-alpha-feat/memory/ctx-handoff.md`)).toBe(false)
+})
+
+test('從 worktree 啟動、主工作樹還沒有經驗檔：建在主工作樹，不建在 worktree 的對話檔目錄', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  const MAIN_NOTES = `${CLAUDE_PROJECTS}/D--main/memory/ctx-handoff.md`
+  w.files.set('C:/proj/.git', 'gitdir: D:/main/.git/worktrees/feat\n')
+  await distillNow($)
+  expect(w.files.get(MAIN_NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
+  expect(w.files.has(NOTES)).toBe(false)
+})
+
+test('沒碰到檔案的已知專案：提示只列開頭，可以新增進去，不能改它的條目', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  w.files.set(NOTES, EXISTING)
+  w.files.set(ALPHA_NOTES, ALPHA_START)
+  w.files.set(`${CLAUDE_PROJECTS}/C--Users-u-AppData-Local-Temp-x/memory/ctx-handoff.md`, ALPHA_START)
+  distillReply = actionsReply(
+    { op: 'add_memory', project: 'P2', type: 'project', text: '只用 MCP 做的 alpha 工作' },
+    { op: 'update_memory', id: 'P2-M1', type: 'user', text: '不該改到' },
+    { op: 'move_memory', id: 'P1-M1', project: 'P2' },
+  )
+  await distillNow($)
+  const prompt = w.forks.find(f => f.includes('=== ACTIONS ===')) ?? ''
+  expect(prompt).toContain('P2 D--repos-alpha（這次沒碰到它的檔案')
+  expect(prompt).toContain('- [user] 甲')
+  expect(prompt).toContain('- 規則：規則一')
+  expect(prompt).not.toContain('AppData-Local-Temp')
+  const alpha = w.files.get(ALPHA_NOTES) ?? ''
+  expect(alpha).toContain('只用 MCP 做的 alpha 工作')
+  expect(alpha).toContain('- [user] 甲')
+  expect(alpha).not.toContain('不該改到')
+  expect(alpha).toContain('- [feedback] 舊 A')
+  expect(lastOf(w).rejected.samples[0]).toContain('P2 只列開頭')
 })

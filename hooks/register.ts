@@ -32,6 +32,9 @@ const INJECT_MIN_COUNT = 2
 const INJECT_RULES = 15
 const EVIDENCE_KEEP = 3
 const NOTE_TAG = '[ctx-handoff 專案經驗]'
+// 整理時順便列出的其他已知專案：最多幾個、每條記憶列多少字
+const KNOWN_MAX = 8
+const BRIEF_CHARS = 60
 
 type Rule = { name: string; count: number; body: string[] }
 // extra：不認得的 `## ` 區段（含標題行）原樣保留，輸出在規則之後
@@ -41,9 +44,17 @@ const ruleText = (r: Rule) =>
   (r.body.find(l => l.startsWith('- 規則：')) ?? r.body[0] ?? '').replace(/^- 規則：/, '').trim()
 
 // 整理提示：列出這個 session 的專案（P1 預設、P2… 是碰過的），每個專案各自的現有記憶與規則
-function distillPrompt(anchor: string | undefined, projects: { path: string; notes: Notes }[]) {
-  const sections = projects.flatMap(({ notes }, p) => {
+function distillPrompt(anchor: string | undefined, projects: { path: string; notes: Notes; brief?: boolean }[]) {
+  const head = (m: string) => {
+    const t = m.replace(/^- /, '').split('\n')[0] ?? ''
+    return t.length > BRIEF_CHARS ? `${t.slice(0, BRIEF_CHARS)}…` : t
+  }
+  const sections = projects.flatMap(({ notes, brief }, p) => {
     const n = p + 1
+    if (brief) {
+      const items = [...notes.memory.map(m => `- ${head(m)}`), ...notes.rules.map(r => `- 規則：${r.name}`)]
+      return ['', `P${n} 的現有條目（只列開頭，用來判斷歸屬、避免重複）：`, ...items]
+    }
     const mem = notes.memory.length ? notes.memory.map((m, i) => `P${n}-M${i + 1} ${m.replace(/^- /, '')}`) : ['（無）']
     const rules = notes.rules.length ? notes.rules.map((r, i) => `P${n}-R${i + 1} ${r.name}｜出現 ${r.count} 次｜${ruleText(r)}`) : ['（無）']
     return ['', `P${n} 目前的記憶（編號只在這次有效）：`, ...mem, '', `P${n} 目前的規則：`, ...rules]
@@ -60,8 +71,8 @@ function distillPrompt(anchor: string | undefined, projects: { path: string; not
     `開頭是 ${tag} 的訊息是 handoff 摘要，只能參考，不能當作證據，也不能 confirm_rule。`,
     '',
     '這個對話涉及的專案：',
-    ...projects.map(({ path }, p) => `P${p + 1} ${path}${p === 0 ? '（預設：session 啟動資料夾）' : ''}`),
-    '每條都要判斷屬於哪個專案：只屬於某個 repo 的經驗放到那個專案，跨專案通用或不確定的放 P1。',
+    ...projects.map(({ path, brief }, p) => `P${p + 1} ${path}${p === 0 ? '（預設：session 啟動資料夾）' : brief ? '（這次沒碰到它的檔案：只能 add_memory、add_rule，或 move 進來）' : ''}`),
+    '每條都要判斷屬於哪個專案：看內容的主題（產品、服務、repo、路徑），不是看這次碰了哪些檔案。屬於某個專案的就放那裡，即使這次沒碰到它的檔案（例如只用 MCP、網頁做的工作）；跨專案通用、或真的判斷不出來的才放 P1。',
     '現有條目放錯專案時，用 move_memory／move_rule 整條搬過去，不要用 delete 再 add（其中一行失效就會遺失）。',
     ...sections,
     '',
@@ -181,12 +192,13 @@ type Action =
 const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.replace(/\s+/g, ' ').trim() : undefined)
 
 // 一行 JSON 轉成動作；無效時回傳原因（記進丟棄樣本，事後查得出是哪一種）
-function toAction(o: Record<string, unknown>, notes: Notes[]): Action | string {
+function toAction(o: Record<string, unknown>, notes: Notes[], brief: ReadonlySet<number> = new Set()): Action | string {
   const ref = (kind: 'M' | 'R') => {
     const m = typeof o.id === 'string' ? /^P(\d+)-([MR])(\d+)$/.exec(o.id) : null
     if (!m || m[2] !== kind) return `id 不是 P<n>-${kind}#`
     const p = Number(m[1]) - 1
     const i = Number(m[3]) - 1
+    if (brief.has(p)) return `P${p + 1} 只列開頭，只能新增或搬入`
     const len = kind === 'M' ? notes[p]?.memory.length : notes[p]?.rules.length
     if (len === undefined) return `沒有專案 P${p + 1}`
     return i >= 0 && i < len ? { p, i } : `沒有編號 ${o.id}`
@@ -273,7 +285,7 @@ const sampleOf = (why: string, line: string) =>
 
 // 只解析兩個標記之間的行，一行一個 JSON；無效的行丟棄並記數與最多 3 個樣本（含原因）。
 // 疑似金鑰的行整行丟棄，樣本不記內容（樣本會寫進 store）
-function parseActions(text: string, notes: Notes[]): { actions: Action[]; rejected: Rejected } {
+function parseActions(text: string, notes: Notes[], brief: ReadonlySet<number> = new Set()): { actions: Action[]; rejected: Rejected } {
   const actions: Action[] = []
   const rejected: Rejected = { count: 0, samples: [] }
   // secret：解析後的值疑似金鑰。值可能是跳脫寫法（\u0073k-…），原始行比對不到，所以不能只靠再比對一次
@@ -297,7 +309,7 @@ function parseActions(text: string, notes: Notes[]): { actions: Action[]; reject
     if (!o || typeof o !== 'object' || Array.isArray(o)) { reject('不是 JSON 物件', line); continue }
     const rec = o as Record<string, unknown>
     if (hasSecret(rec)) { reject('疑似金鑰', '', true); continue }
-    const a = toAction(rec, notes)
+    const a = toAction(rec, notes, brief)
     if (typeof a === 'string') reject(a, line)
     else actions.push(a)
   }
@@ -660,6 +672,8 @@ async function notesFile($: EngineInterface, existingOnly = false) {
   const candidates = roots.map(p => `${base}/${encodeProject(p)}/memory/ctx-handoff.md`)
   // 新對話剛開始時對話檔還不存在，先用路徑推得的位置
   for (const file of candidates) if (await $.fs.exists(file)) return file
+  // 啟動資料夾在 repo 子資料夾或 worktree：對話檔在啟動資料夾的目錄，不能拿它當專案目錄
+  if (roots.length > 1) return existingOnly ? undefined : candidates[0]
   const dir = await projectDir($)
   if (dir !== undefined) {
     const file = `${dir}/memory/ctx-handoff.md`
@@ -723,7 +737,10 @@ async function projectRootOf($: EngineInterface, raw: string, isDir: boolean, cw
   const git = await gitRootOf($, isDir ? p : p.slice(0, Math.max(p.lastIndexOf('/'), 0)))
   if (git) {
     const covers = (outer: string) => sameDir(git, outer) || isInside(outer, git)
-    return covers(root) || covers(claude) ? undefined : git
+    if (covers(root) || covers(claude)) return undefined
+    // worktree 算主工作樹那個專案：經驗跟著 repo，不跟著臨時資料夾
+    const main = await mainWorktree($, git)
+    return sameDir(main, root) ? undefined : main
   }
   if (sameDir(p, claude) || isInside(p, claude) || !isInside(p, root)) return undefined
   const rest = p.slice(root.length + 1).split('/')
@@ -808,19 +825,34 @@ async function trackTouch($: EngineInterface, e: Record<string, unknown>) {
 }
 
 // ---------- 背景整理 ----------
-type Proj = { path: string; label: string; file: string; original: string; notes: Notes }
+// brief：這次沒碰到檔案的已知專案，整理提示只列條目開頭，只能新增或搬入
+type Proj = { path: string; label: string; file: string; original: string; notes: Notes; brief?: boolean }
 
-// P1 是 session 啟動資料夾的預設專案；之後是這個 session 碰過的專案（經驗檔相同的併入 P1）
+// P1 是 session 啟動資料夾的預設專案；之後是這個 session 碰過的專案（經驗檔相同的併入 P1），
+// 最後是其他已有經驗的專案：只用 MCP、網頁做的工作不會留下檔案路徑，靠內容主題也能歸到對的專案
 async function loadProjects($: EngineInterface, sid: string, p1File: string, root: string) {
   const load = async (path: string, label: string, file: string): Promise<Proj> => {
     const original = await readText($, file)
     return { path, label, file, original, notes: parseNotes(original) }
   }
   const projects = [await load(root, '', p1File)]
+  const has = (file: string) => projects.some(p => sameDir(p.file, file))
   for (const r of touched.get(sid) ?? []) {
     const file = await projectNotesFile($, r)
-    if (projects.some(p => p.file === file)) continue
+    if (has(file)) continue
     projects.push(await load(r, r.split('/').at(-1) || r, file))
+  }
+  const base = `${await claudeDir($)}/projects`
+  let known = 0
+  for (const e of await $.fs.list(base).catch(() => [])) {
+    if (known >= KNOWN_MAX) break
+    if (e.kind !== 'dir' || /-AppData-Local-Temp-/i.test(e.name)) continue
+    const file = `${base}/${e.name}/memory/ctx-handoff.md`
+    if (has(file) || !(await $.fs.exists(file))) continue
+    const p = await load(e.name, e.name, file)
+    if (p.notes.memory.length + p.notes.rules.length === 0) continue
+    projects.push({ ...p, brief: true })
+    known += 1
   }
   return projects
 }
@@ -852,7 +884,8 @@ async function distill($: EngineInterface, why: string, queue = true) {
     if (!r.isAnswered) { await fail(forkFailure(r.reason)); return r }
     const now = await $.clock.now()
     const stamp = localStamp(now)
-    const { actions, rejected } = parseActions(r.text, projects.map(p => p.notes))
+    const brief = new Set(projects.flatMap((p, i) => (p.brief ? [i] : [])))
+    const { actions, rejected } = parseActions(r.text, projects.map(p => p.notes), brief)
     // 每個專案各自檢查：fork 期間那份檔案被改過，編號對不上，只略過它；其他照寫。
     // 先決定略過哪些再套用：搬移的任一端被略過，整筆搬移都不做，避免一邊刪了、另一邊沒寫進去
     const skippedIdx = new Set<number>()
