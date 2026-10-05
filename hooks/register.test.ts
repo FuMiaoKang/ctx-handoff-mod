@@ -347,13 +347,13 @@ test('依編號套用新增／更新／刪除／確認，超出範圍的忽略�
   const w = world(on, 100_000, 1_000_000, { 'distill:S1': { turn: 3, anchor: '上次最後一則訊息' } }, [], 6)
   w.files.set(NOTES, EXISTING)
   distillReply = actionsReply(
-    { op: 'update_memory', id: 'P1-M1', type: 'feedback', text: '改過的 A' },
-    { op: 'delete_memory', id: 'P1-M2', reason: '已過時' },
+    { op: 'update_memory', id: 'M1', type: 'feedback', text: '改過的 A' },
+    { op: 'delete_memory', id: 'M2', reason: '已過時' },
     { op: 'add_memory', type: 'user', text: '新的偏好' },
-    { op: 'delete_memory', id: 'P1-M9', reason: '超出範圍' },
-    { op: 'confirm_rule', id: 'P1-R1', evidence: '又被證實一次' },
-    { op: 'delete_rule', id: 'P1-R2', reason: '被推翻' },
-    { op: 'confirm_rule', id: 'P1-R9', evidence: '超出範圍' },
+    { op: 'delete_memory', id: 'M9', reason: '超出範圍' },
+    { op: 'confirm_rule', id: 'R1', evidence: '又被證實一次' },
+    { op: 'delete_rule', id: 'R2', reason: '被推翻' },
+    { op: 'confirm_rule', id: 'R9', evidence: '超出範圍' },
     { op: 'add_rule', name: '沒有規則內容的條目', evidence: '缺規則，應丟棄' },
   )
   w.rows.push(
@@ -367,8 +367,8 @@ test('依編號套用新增／更新／刪除／確認，超出範圍的忽略�
   expect(w.forks[0]).toContain('【助理】好的')
   expect(w.forks[0]).toContain('〔工具 Bash〕{"command":"ls"} → a.ts')
   expect(w.forks[0]).not.toContain('更早的訊息')
-  expect(w.forks[0]).toContain('P1-M1 [feedback] 舊 A')
-  expect(w.forks[0]).toContain('P1-R2 規則二｜出現 2 次｜做 Y')
+  expect(w.forks[0]).toContain('M1 [feedback] 舊 A')
+  expect(w.forks[0]).toContain('R2 規則二｜出現 2 次｜做 Y')
   const notes = w.files.get(NOTES) ?? ''
   expect(notes).toContain('- [feedback] 改過的 A\n- [user] 新的偏好')
   expect(notes).not.toContain('舊 B')
@@ -399,7 +399,7 @@ test('整理期間檔案被手動修改：不套用、不排入，下次重新�
   w.files.set(NOTES, EXISTING)
   onFork = () => { w.files.set(NOTES, `${EXISTING}\n- [user] 使用者剛手動加的\n`) }
   const r = await distillNow($)
-  expect(r.text).toContain('整理期間檔案被修改')
+  expect(r.text).toContain('整理期間經驗檔被修改')
   expect(w.files.get(NOTES) ?? '').toContain('使用者剛手動加的')
   await say($, '下一則')
   expect(w.contexts[0]).toBeUndefined()
@@ -594,23 +594,13 @@ test('S5 狀態只顯示目前專案的資訊', async ($, on) => {
   expect(s).not.toContain('別的專案')
 })
 
-test('S5 session.start：舊的全域 handoffs 只搬屬於這個專案的，一次，舊鍵不動', async ($, on) => {
-  const old = [saved('present', 1), { ...saved('manual', 2), sessionId: 'ZZ' }]
-  const w = world(on, 100_000, 1_000_000, { handoffs: old })
-  await startSession($)
-  expect(w.get('handoffs:C--proj')).toEqual([old[0]])
-  expect(w.get('handoffs')).toEqual(old)
-  expect(w.get('migrated:C--proj')).toBe(true)
-  await startSession($)
-  expect(w.get('handoffs:C--proj')).toEqual([old[0]])
-})
-
 test('使用者已有 /handoff：改註冊 /ctx-handoff，指令照常可用，啟動時的整理照跑', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, { handoffs: [saved('present', 1)] })
+  const w = world(on, 100_000, 1_000_000, { 'last:OLD': 'x' })
   takenCommands = new Set(['handoff'])
   await startSession($)
   expect(registered).toEqual(['handoff', 'ctx-handoff'])
-  expect(w.get('migrated:C--proj')).toBe(true)
+  // 啟動時的 store 清理照跑：每 session 的鍵記進 seen
+  expect((w.get('seen') as Record<string, number>)['last:OLD']).toBeDefined()
   const r = await $.command.run({ command: 'ctx-handoff', args: '', origin: composer, presentation })
   expect(r.text).toContain('背景整理')
 })
@@ -753,7 +743,7 @@ test('S7 真實經驗檔複本：解析再輸出（扣掉更新時間）完全�
   await distillNow($)
   expect(w.files.get(NOTES) ?? '').toContain('暫時的一條')
   n = 9
-  distillReply = actionsReply({ op: 'delete_memory', id: `P1-M${items + 1}`, reason: '還原' })
+  distillReply = actionsReply({ op: 'delete_memory', id: `M${items + 1}`, reason: '還原' })
   await distillNow($)
   const out = w.files.get(NOTES) ?? ''
   expect(out).not.toContain('暫時的一條')
@@ -791,7 +781,7 @@ test('S7 記憶的延續行與自訂區段原樣保留；同名規則的 ADD 略
     { op: 'add_rule', name: '規則乙', rule: '做乙', applies: 'x', not_applies: 'y', evidence: '新的' },
   )
   await distillNow($)
-  expect(w.forks[0]).toContain('P1-M1 [user] 第一條\n  延續行 A\n  - 縮排子項')
+  expect(w.forks[0]).toContain('M1 [user] 第一條\n  延續行 A\n  - 縮排子項')
   const out = w.files.get(NOTES) ?? ''
   expect(out).toContain('## 記憶\n- [user] 第一條\n  延續行 A\n  - 縮排子項\n- [project] 第二條\n- [user] 新增的一條\n')
   expect(out).toContain('### 規則甲（2 次）\n- 規則：做甲\n- 根據：2026-01-01 一\n')
@@ -902,22 +892,7 @@ test('S9 已攔下訊息的離席狀態不會因回合完成被刪', async ($, o
 
 // ---------- S10：長路徑專案 ----------
 
-test('S10 編碼後的路徑和實際目錄不同：第二個 session 靠記下的對照找到經驗檔', async ($, on) => {
-  const w = world(on, 100_000)
-  const base = 'C:/Users/u/.claude/projects'
-  w.files.delete(`${base}/C--proj/S1.jsonl`)
-  w.files.set(`${base}/LONG/S1.jsonl`, '')
-  w.files.set(`${base}/LONG/memory/ctx-handoff.md`, EXISTING)
-  const first = await $.prompt.context({ blocks: [] })
-  expect(first.blocks.find(b => b.name === 'ctxHandoffProject')).toBeDefined()
-  expect(w.get('projdir:C--proj')).toBe(`${base}/LONG`)
-  // 新 session 的對話檔還不存在，掃不到；只能靠對照
-  curSid = 'S2'
-  const second = await $.prompt.context({ blocks: [] })
-  expect(second.blocks.find(b => b.name === 'ctxHandoffProject')?.text).toContain('- [feedback] 舊 A')
-})
-
-// ---------- JSONL 動作與依專案分檔 ----------
+// ---------- JSONL 動作與工作區經驗檔 ----------
 
 const CLAUDE_PROJECTS = 'C:/Users/u/.claude/projects'
 const ALPHA = 'D:/repos/alpha'
@@ -925,11 +900,7 @@ const ALPHA_NOTES = `${CLAUDE_PROJECTS}/D--repos-alpha/memory/ctx-handoff.md`
 type World = ReturnType<typeof world>
 // 把 D:/repos/<name> 變成有 .git 的 repo
 const repo = (w: World, dir: string) => { w.files.set(`${dir}/.git`, '') }
-// 模擬磁碟上存在的子資料夾（fs.list 由檔案清單推出資料夾）
-const dir = (w: World, path: string) => { w.files.set(`${path}/.keep`, '') }
 const read = ($: Engine, file: string) => $.tool.call({ tool: 'Read', file_path: file })
-// 整理提示裡「這個對話涉及的專案」那幾行（P<n> 路徑）
-const projectsIn = (prompt: string) => prompt.split('\n').filter(l => /^P\d+ (?!目前)/.test(l))
 const lastOf =(w: World) => w.get('distill:last:C--proj') as { changes: string[]; rejected: { count: number; samples: string[] } }
 
 test('JSONL 一行壞掉、一個不認得的 op：有效的照套用，記下丟棄 2 行與樣本，狀態看得到', async ($, on) => {
@@ -966,74 +937,13 @@ test('JSONL 樣本最多 3 個；長的行保留頭 100 字與尾 50 字', async
   expect(rejected.samples[2]).toEndWith('：c')
 })
 
-test('add_memory 指定 P2：只寫進 P2 的經驗檔，P1 不動；變動以專案名稱當前綴', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/src/a.ts`)
-  distillReply = actionsReply({ op: 'add_memory', project: 'P2', type: 'project', text: 'alpha 專屬的決定' })
-  await distillNow($)
-  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('## 記憶\n- [project] alpha 專屬的決定')
-  expect(w.files.has(NOTES)).toBe(false)
-  expect(lastOf(w).changes).toEqual(['[alpha] 新增記憶：[project] alpha 專屬的決定'])
-  // 差異帶入下一則訊息時，前綴與兩個檔案的位置都在
-  await say($, '下一則')
-  expect(w.contexts[0]?.[0]).toContain('[alpha] 新增記憶')
-  expect(w.contexts[0]?.[0]).toContain(ALPHA_NOTES)
-})
-
-test('add_memory／add_rule 省略 project：預設寫進 P1', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  await distillNow($)
-  expect(w.files.get(NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
-  expect(w.files.has(ALPHA_NOTES)).toBe(false)
-})
-
-test('update／delete／confirm 靠 P<n>-M#／P<n>-R# 編號，各專案各自編號；沒列出的專案與超出範圍的編號丟棄', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, EXISTING)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  distillReply = actionsReply(
-    { op: 'update_memory', id: 'P1-M1', type: 'feedback', text: 'P1 改過的 A' },
-    { op: 'delete_memory', id: 'P2-M2', reason: 'P2 的舊 B 過時' },
-    { op: 'confirm_rule', id: 'P1-R1', evidence: 'P1 又被證實' },
-    { op: 'update_rule', id: 'P2-R2', rule: 'P2 改過的 Y' },
-    { op: 'delete_rule', id: 'P1-R2', reason: 'P1 規則二被推翻' },
-    // 全部應被丟棄：沒有列出的專案、超出範圍、類型與編號種類不符、P0
-    { op: 'delete_memory', id: 'P3-M1', reason: '沒有 P3' },
-    { op: 'delete_memory', id: 'P1-M9', reason: '超出範圍' },
-    { op: 'delete_memory', id: 'P1-M0', reason: '編號從 1 開始' },
-    { op: 'confirm_rule', id: 'P2-R9', evidence: '超出範圍' },
-    { op: 'delete_rule', id: 'P1-M1', reason: 'M 不是規則' },
-    { op: 'delete_memory', id: 'P0-M1', reason: 'P0' },
-    { op: 'add_memory', project: 'P5', type: 'user', text: '沒有 P5' },
-  )
-  await distillNow($)
-  const p1 = w.files.get(NOTES) ?? ''
-  const p2 = w.files.get(ALPHA_NOTES) ?? ''
-  expect(p1).toContain('- [feedback] P1 改過的 A')
-  expect(p1).toContain('- [project] 舊 B')
-  expect(p1).toContain('### 規則一（2 次）')
-  expect(p1).toContain('- 根據：1970-01-01 P1 又被證實')
-  expect(p1).not.toContain('規則二')
-  expect(p2).toContain('- [feedback] 舊 A')
-  expect(p2).not.toContain('舊 B')
-  expect(p2).toContain('- 規則：P2 改過的 Y')
-  expect(p2).toContain('### 規則一（1 次）')
-  expect(lastOf(w).rejected.count).toBe(7)
-  expect(p1 + p2).not.toContain('沒有 P5')
-})
-
 test('疑似金鑰的動作整行丟棄（任何欄位），樣本不記內容', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
   distillReply = actionsReply(
     { op: 'add_memory', type: 'user', text: '正常的一條' },
     { op: 'add_memory', type: 'user', text: '金鑰 ghp_abcdefghijklmnop' },
     { op: 'add_rule', name: '規則', rule: '做事', applies: 'a', not_applies: 'b', evidence: 'password=hunter2' },
-    { op: 'delete_memory', id: 'P1-M1', reason: 'token: abc' },
+    { op: 'delete_memory', id: 'M1', reason: 'token: abc' },
     '這行不是 JSON 但有 api_key=zzz',
   )
   w.files.set(NOTES, EXISTING)
@@ -1063,7 +973,7 @@ test('動作的 type 不在 user|feedback|project|reference、缺必要欄位：
     { op: 'add_memory', text: '沒有類型' },
     { op: 'add_memory', type: 'user' },
     { op: 'add_rule', name: '缺欄位', rule: 'r', applies: 'a', evidence: 'e' },
-    { op: 'delete_rule', id: 'P1-R1' },
+    { op: 'delete_rule', id: 'R1' },
   )
   w.files.set(NOTES, EXISTING)
   await distillNow($)
@@ -1071,154 +981,7 @@ test('動作的 type 不在 user|feedback|project|reference、缺必要欄位：
   expect(w.files.get(NOTES) ?? '').toBe(EXISTING)
 })
 
-test('碰過的專案：有 .git 的目錄列為 P2；session 根目錄底下沒有 .git 的取第一層子資料夾；AppData、隱藏資料夾、根目錄本身不算', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  repo(w, ALPHA)
-  for (const d of ['web', 'lib', 'api']) dir(w, `C:/proj/${d}`)
-  await read($, `${ALPHA}/src/deep/a.ts`)
-  await read($, 'C:/proj/web/src/b.ts')
-  await read($, 'C:/proj/AppData/Local/x.txt')
-  await read($, 'C:/proj/.cache/y.txt')
-  await read($, 'C:/proj/readme.md')
-  await $.tool.call({ tool: 'Glob', pattern: '*', path: 'C:/proj' })
-  await $.tool.call({ tool: 'Grep', pattern: 'x', path: 'C:/proj/lib' })
-  // Bash 沒有路徑欄位，改看目前工作目錄
-  curCwd = 'C:/proj/api/sub'
-  await $.tool.call({ tool: 'Bash', command: 'ls' })
-  curCwd = 'C:/proj'
-  await $.tool.call({ tool: 'Bash', command: 'ls' })
-  await distillNow($)
-  const p = w.forks[0] ?? ''
-  const listed = projectsIn(p)
-  expect(listed).toEqual([
-    'P1 C:/proj（預設：session 啟動資料夾）',
-    `P2 ${ALPHA}`,
-    'P3 C:/proj/web',
-    'P4 C:/proj/lib',
-    'P5 C:/proj/api',
-  ])
-  expect(p).not.toContain('AppData')
-  expect(p).not.toContain('.cache')
-  expect((await cmd($, '')).text).toContain('本次對話也碰過')
-})
-
-test('碰過的專案：<claude> 底下非 repo 的路徑不算，repo 算；路徑不分大小寫比對', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  curRoot = 'C:\\Users\\u'
-  curCwd = 'C:/Users/u'
-  repo(w, 'C:/Users/u/.claude/mods/ctx-handoff')
-  repo(w, 'C:/Users/u/work')
-  await read($, 'C:/Users/u/.claude/skills/x/SKILL.md')
-  await read($, 'C:/Users/u/.claude/mods/ctx-handoff/hooks/register.ts')
-  await read($, 'C:/Users/u/AppData/Local/Temp/z.txt')
-  await read($, 'C:/Users/u/work/f.ts')
-  // 再碰同一個專案（磁碟代號與路徑大小寫不同）：不重複列出
-  await read($, 'c:/users/u/work/g.ts')
-  await distillNow($)
-  const listed = projectsIn(w.forks[0] ?? '')
-  expect(listed).toEqual([
-    'P1 C:/Users/u（預設：session 啟動資料夾）',
-    'P2 C:/Users/u/.claude/mods/ctx-handoff',
-    'P3 C:/Users/u/work',
-  ])
-})
-
-test('碰過的專案：session 根目錄自己就在 repo 裡時，整個根目錄屬於 P1，不列出', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  repo(w, 'C:/proj')
-  await read($, 'C:/proj/src/a.ts')
-  await distillNow($)
-  expect(projectsIn(w.forks[0] ?? '')).toEqual(['P1 C:/proj（預設：session 啟動資料夾）'])
-})
-
-test('碰過的專案：根目錄底下的單一檔案、不存在的子資料夾、MCP 工具的 path 都不算；.. 會先解開', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  dir(w, 'C:/proj/api')
-  await $.tool.call({ tool: 'Grep', pattern: 'x', path: 'C:/proj/notes.txt' })
-  await read($, 'C:/proj/ghost/a.ts')
-  // MCP 工具不在內建工具的型別清單裡
-  await $.tool.call({ tool: 'mcp__x__search', path: 'notes/today' } as never)
-  await read($, 'C:/proj/web/../api/x.ts')
-  await distillNow($)
-  expect(projectsIn(w.forks[0] ?? '')).toEqual(['P1 C:/proj（預設：session 啟動資料夾）', 'P2 C:/proj/api'])
-})
-
-test('碰過的專案最多記 8 個，超過就丟最舊的', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  for (let i = 1; i <= 10; i++) dir(w, `C:/proj/d${i}`)
-  for (let i = 1; i <= 10; i++) await read($, `C:/proj/d${i}/f.ts`)
-  await distillNow($)
-  const listed = projectsIn(w.forks[0] ?? '')
-  expect(listed.length).toBe(9)
-  expect(listed[1]).toBe('P2 C:/proj/d3')
-  expect(listed[8]).toBe('P9 C:/proj/d10')
-})
-
-test('P2 的經驗檔在 fork 期間被改：只略過 P2 並記下錯誤，P1 的變動照寫', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(ALPHA_NOTES, EXISTING)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  distillReply = actionsReply(
-    { op: 'add_memory', type: 'user', text: 'P1 的新記憶' },
-    { op: 'add_memory', project: 'P2', type: 'user', text: 'P2 的新記憶' },
-  )
-  const edited = `${EXISTING}\n- [user] 手動加的\n`
-  onFork = () => { w.files.set(ALPHA_NOTES, edited) }
-  await distillNow($)
-  expect(w.files.get(NOTES) ?? '').toContain('P1 的新記憶')
-  expect(w.files.get(ALPHA_NOTES)).toBe(edited)
-  const err = w.get('distill:error:C--proj') as { reason: string }
-  expect(err.reason).toContain('整理期間檔案被修改')
-  expect(err.reason).toContain(ALPHA_NOTES)
-  expect(err.reason).not.toContain(NOTES)
-  // P1 已寫成：進度有推進，只有寫成的變動排入下一則訊息
-  expect(w.get('distill:S1')).toBeDefined()
-  await say($, '下一則')
-  expect(w.contexts.at(-1)?.[0]).toContain('新增記憶：[user] P1 的新記憶')
-  expect(w.contexts.at(-1)?.[0]).not.toContain('P2 的新記憶')
-})
-
-test('首次碰到有經驗檔的專案：下一則人類訊息帶入它的經驗，再碰不重複，斜線指令不消耗，P1 不帶', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, EXISTING)
-  repo(w, ALPHA)
-  repo(w, 'D:/repos/beta')
-  await read($, `${ALPHA}/a.ts`)
-  // 沒有經驗檔的專案不帶
-  await read($, 'D:/repos/beta/b.ts')
-  // P1 範圍內的路徑不帶 P1 的經驗
-  await read($, 'C:/proj/readme.md')
-  await say($, '/handoff')
-  expect(w.contexts[0]).toBeUndefined()
-  await say($, '第一則')
-  const block = w.contexts[1]?.[0] ?? ''
-  expect(block).toContain(NOTE_TAG)
-  expect(block).toContain(`專案 ${ALPHA}`)
-  expect(block).toContain(ALPHA_NOTES)
-  expect(block).toContain('- [feedback] 舊 A')
-  expect(block).toContain('- 規則二（2 次）：做 Y')
-  expect(w.contexts[1]?.length).toBe(1)
-  // 再碰同一個專案：不再帶入
-  await read($, `${ALPHA}/c.ts`)
-  await say($, '第二則')
-  expect(w.contexts[2]).toBeUndefined()
-})
-
-test('首次碰到專案的經驗在訊息被丟棄時不消耗，下一則才帶入', async ($, on) => {
-  const w = world(on, 100_000)
-  w.files.set(ALPHA_NOTES, EXISTING)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  failSubmits = 1
-  const r = await say($, '被丟棄')
-  expect((r as { drop?: string }).drop).toBe('submit boom')
-  await say($, '下一則')
-  expect(w.contexts[0]?.[0]).toContain(`專案 ${ALPHA}`)
-})
-
-test('整理提示：有繁體中文指示、專案清單、每個專案各自的記憶與規則編號、JSONL 輸出格式', async ($, on) => {
+test('整理提示：繁體中文指示、只有這個工作區的記憶與規則編號、JSONL 輸出格式；別的 repo 的經驗不列入', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
   w.files.set(NOTES, EXISTING)
   w.files.set(ALPHA_NOTES, '# x\n\n## 記憶\n- [user] alpha 的記憶\n\n## 規則\n\n### alpha 規則（3 次）\n- 規則：做 A\n')
@@ -1227,17 +990,17 @@ test('整理提示：有繁體中文指示、專案清單、每個專案各自�
   await distillNow($)
   const p = w.forks[0] ?? ''
   expect(p).toContain('一律用繁體中文（台灣）撰寫；程式碼、指令、路徑、錯誤訊息與專有名詞維持原文')
-  expect(p).toContain('P1 C:/proj（預設：session 啟動資料夾）')
-  expect(p).toContain(`P2 ${ALPHA}`)
-  expect(p).toContain('每條都要判斷屬於哪個專案：看內容的主題（產品、服務、repo、路徑），不是看這次碰了哪些檔案')
-  expect(p).toContain('P1-M2 [project] 舊 B')
-  expect(p).toContain('P1-R1 規則一｜出現 1 次｜做 X')
-  expect(p).toContain('P2-M1 [user] alpha 的記憶')
-  expect(p).toContain('P2-R1 alpha 規則｜出現 3 次｜做 A')
+  expect(p).toContain('M2 [project] 舊 B')
+  expect(p).toContain('R1 規則一｜出現 1 次｜做 X')
+  expect(p).not.toContain('alpha')
+  expect(p).not.toContain('P2')
   expect(p).toContain('=== ACTIONS ===')
   expect(p).toContain('=== END ===')
-  expect(p).toContain('{"op":"add_memory","project":"P2","type":"project","text":"…"}')
-  expect(p).toContain('{"op":"delete_rule","id":"P1-R4","reason":"…"}')
+  expect(p).toContain('{"op":"add_memory","type":"project","text":"…"}')
+  expect(p).toContain('{"op":"delete_rule","id":"R4","reason":"…"}')
+  // 碰過別的 repo 也只寫這個工作區的經驗檔
+  expect(w.files.get(ALPHA_NOTES) ?? '').not.toContain('使用者決定交接門檻維持 600k')
+  expect(w.files.get(NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
 })
 
 test('沒有 ACTIONS 標記的輸出：不套用，記一行丟棄；空的 ACTIONS 區塊視為沒有變動', async ($, on) => {
@@ -1340,66 +1103,22 @@ test('離席：只有圖片的第一則訊息不記成攔下的訊息，提示�
   expect(w.get('away:S1')).toEqual({ handoff: 'H' })
 })
 
-const ALPHA_START = ['# ctx-handoff 專案經驗', '', '## 記憶', '- [user] 甲', '', '## 規則', '', '### 規則一（2 次）', '- 規則：做 X', ''].join('\n')
 
-test('move_memory／move_rule：整條搬到 P2；同名規則次數併入', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, ALPHA_START)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  distillReply = actionsReply(
-    { op: 'move_memory', id: 'P1-M1', project: 'P2' },
-    { op: 'move_rule', id: 'P1-R1', project: 'P2' },
-    { op: 'move_rule', id: 'P1-R2', project: 'P2' },
-  )
-  await distillNow($)
-  const p1 = w.files.get(NOTES) ?? ''
-  const p2 = w.files.get(ALPHA_NOTES) ?? ''
-  expect(p1).not.toContain('舊 A')
-  expect(p1).not.toContain('### 規則一')
-  expect(p1).not.toContain('### 規則二')
-  expect(p2).toContain('- [feedback] 舊 A')
-  expect(p2).toContain('- [user] 甲')
-  // P1 的規則一（1 次）併入 P2 的規則一（2 次）
-  expect(p2).toContain('### 規則一（3 次）')
-  expect(p2.split('### 規則一').length - 1).toBe(1)
-  expect(p2).toContain('### 規則二（2 次）\n- 規則：做 Y')
-  const { changes } = lastOf(w)
-  expect(changes).toContain('搬出記憶（到 P2）：[feedback] 舊 A')
-  expect(changes).toContain('[alpha] 搬入記憶：[feedback] 舊 A')
-})
-
-test('搬移的目的地在 fork 期間被改：整筆不做，來源不刪', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, ALPHA_START)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  distillReply = actionsReply({ op: 'move_memory', id: 'P1-M1', project: 'P2' })
-  const edited = `${ALPHA_START}\n- [user] 手動加的\n`
-  onFork = () => { w.files.set(ALPHA_NOTES, edited) }
-  await distillNow($)
-  expect(w.files.get(NOTES)).toBe(EXISTING)
-  expect(w.files.get(ALPHA_NOTES)).toBe(edited)
-  const err = w.get('distill:error:C--proj') as { reason: string }
-  expect(err.reason).toContain(ALPHA_NOTES)
-})
-
-test('丟棄樣本寫出原因：專案不存在、搬到同一個專案、type 無效', async ($, on) => {
+test('丟棄樣本寫出原因：舊格式編號、不認得的 op、type 無效', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
   w.files.set(NOTES, EXISTING)
   distillReply = actionsReply(
-    { op: 'add_memory', project: 'P5', type: 'user', text: 'x' },
-    { op: 'move_memory', id: 'P1-M1', project: 'P1' },
+    { op: 'delete_memory', id: 'P1-M1', reason: 'x' },
+    { op: 'move_memory', id: 'M1', project: 'P2' },
     { op: 'add_memory', type: 'misc', text: 'y' },
   )
   await distillNow($)
   const { rejected } = lastOf(w)
   expect(rejected.count).toBe(3)
-  expect(rejected.samples[0]).toStartWith('沒有專案 P5：')
-  expect(rejected.samples[1]).toStartWith('搬到同一個專案：')
+  expect(rejected.samples[0]).toStartWith('id 不是 M#：')
+  expect(rejected.samples[1]).toStartWith('不認得的 op（move_memory）：')
   expect(rejected.samples[2]).toStartWith('type 無效（misc）：')
+  expect(w.files.get(NOTES) ?? '').toContain('- [feedback] 舊 A')
 })
 
 test('Bash cd 進別的 repo：P1 與 store 的專案鍵仍是 session 啟動資料夾', async ($, on) => {
@@ -1447,39 +1166,6 @@ test('從 git worktree 啟動：經驗檔與專案鍵跟著主工作樹', async 
   expect(w.get('distill:last:D--main')).toBeDefined()
 })
 
-test('搬移時先寫目的地：來源的寫入失敗，條目仍在目的地', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, ALPHA_START)
-  repo(w, ALPHA)
-  failWrite = NOTES
-  await read($, `${ALPHA}/a.ts`)
-  distillReply = actionsReply({ op: 'move_memory', id: 'P1-M1', project: 'P2' })
-  await distillNow($)
-  expect(w.writes.filter(p => p.endsWith('ctx-handoff.md'))[0]).toBe(ALPHA_NOTES)
-  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('- [feedback] 舊 A')
-  expect(w.files.get(NOTES)).toBe(EXISTING)
-})
-
-for (const [label, failing] of [['P2', ALPHA_NOTES], ['P1', NOTES]] as const) test(`兩個專案互相搬移、${label} 寫入失敗：被搬的條目都還在某一份檔案裡`, async ($, on) => {
-  {
-    const w = world(on, 100_000, 1_000_000, {}, [], 5)
-    w.files.set(NOTES, EXISTING)
-    w.files.set(ALPHA_NOTES, ALPHA_START)
-    repo(w, ALPHA)
-    failWrite = failing
-    await read($, `${ALPHA}/a.ts`)
-    distillReply = actionsReply(
-      { op: 'move_memory', id: 'P1-M1', project: 'P2' },
-      { op: 'move_memory', id: 'P2-M1', project: 'P1' },
-    )
-    await distillNow($)
-    const all = `${w.files.get(NOTES) ?? ''}\n${w.files.get(ALPHA_NOTES) ?? ''}`
-    expect(all).toContain('- [feedback] 舊 A')
-    expect(all).toContain('- [user] 甲')
-  }
-})
-
 test('巢狀值裡的疑似金鑰：整行丟棄，樣本不帶內容', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
   distillReply = actionsReply(
@@ -1503,94 +1189,21 @@ test('worktree 的 gitdir 是相對路徑：仍對到主工作樹', async ($, on
   expect(w.get('distill:last:C--main')).toBeDefined()
 })
 
-test('同一條被搬兩次：只有第一次生效，第三個專案的檔案和原本一樣（除了更新時間）', async ($, on) => {
+test('整理有變動：跳出提示，寫出項數與經驗檔的完整路徑；沒有變動不提示', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  const BETA = 'D:/repos/beta'
-  const BETA_NOTES = `${CLAUDE_PROJECTS}/D--repos-beta/memory/ctx-handoff.md`
-  const BETA_START = ['# ctx-handoff 專案經驗', '', '## 記憶', '- [user] 乙', '', '## 規則', '', '### 規則二（5 次）', '- 規則：做 Y', ''].join('\n')
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, ALPHA_START)
-  w.files.set(BETA_NOTES, BETA_START)
-  repo(w, ALPHA)
-  repo(w, BETA)
-  await read($, `${ALPHA}/a.ts`)
-  await read($, `${BETA}/b.ts`)
   distillReply = actionsReply(
-    { op: 'move_memory', id: 'P1-M1', project: 'P2' },
-    { op: 'move_memory', id: 'P1-M1', project: 'P3' },
-    { op: 'move_rule', id: 'P1-R2', project: 'P2' },
-    { op: 'move_rule', id: 'P1-R2', project: 'P3' },
-  )
-  await distillNow($)
-  const beta = w.files.get(BETA_NOTES) ?? ''
-  expect(beta).not.toContain('舊 A')
-  expect(beta).toContain('### 規則二（5 次）')
-  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('- [feedback] 舊 A')
-  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('### 規則二（2 次）')
-  expect(lastOf(w).changes.some(c => c.startsWith('[beta]'))).toBe(false)
-})
-
-// 搬走的條目在同一批又被刪除或修改：第一階段只加不刪，任何一份寫入失敗，原文都還在某一份檔案裡
-for (const [label, failing] of [['P1', NOTES], ['P2', ALPHA_NOTES]] as const) {
-  for (const [kind, extra] of [
-    ['delete_memory', { op: 'delete_memory', id: 'P2-M1', reason: '搬走後又刪' }],
-    ['update_memory', { op: 'update_memory', id: 'P2-M1', type: 'user', text: 'ZZ' }],
-    ['update_rule', { op: 'update_rule', id: 'P2-R1', rule: 'ZZ' }],
-  ] as const) {
-    test(`互換後又 ${kind} 來源、${label} 寫入失敗：搬走的原文還在`, async ($, on) => {
-      const w = world(on, 100_000, 1_000_000, {}, [], 5)
-      w.files.set(NOTES, EXISTING)
-      w.files.set(ALPHA_NOTES, ALPHA_START)
-      repo(w, ALPHA)
-      failWrite = failing
-      await read($, `${ALPHA}/a.ts`)
-      distillReply = actionsReply(
-        { op: 'move_memory', id: 'P1-M1', project: 'P2' },
-        { op: 'move_memory', id: 'P2-M1', project: 'P1' },
-        { op: 'move_rule', id: 'P2-R1', project: 'P1' },
-        extra,
-      )
-      await distillNow($)
-      const all = `${w.files.get(NOTES) ?? ''}\n${w.files.get(ALPHA_NOTES) ?? ''}`
-      expect(all).toContain('- [feedback] 舊 A')
-      expect(all).toContain('- [user] 甲')
-      expect(all).toContain('- 規則：做 X')
-    })
-  }
-}
-
-test('整理有變動：跳出提示，寫出項數與每份經驗檔的完整路徑；沒有變動不提示', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(ALPHA_NOTES, ALPHA_START)
-  repo(w, ALPHA)
-  await read($, `${ALPHA}/a.ts`)
-  distillReply = actionsReply(
-    { op: 'add_memory', type: 'user', text: 'P1 的新記憶' },
-    { op: 'add_memory', project: 'P2', type: 'user', text: 'P2 的新記憶' },
+    { op: 'add_memory', type: 'user', text: '第一條新記憶' },
+    { op: 'add_memory', type: 'user', text: '第二條新記憶' },
   )
   await distillNow($)
   const toast = w.toasts.find(t => t.includes('經驗已更新'))
   expect(toast).toContain('經驗已更新 2 項，會跟著你下一則訊息帶入')
   expect(toast).toContain(NOTES)
-  expect(toast).toContain(ALPHA_NOTES)
   distillReply = actionsReply()
   await say($, '再一則')
   const before = w.toasts.length
   await distillNow($)
   expect(w.toasts.slice(before).some(t => t.includes('經驗已更新'))).toBe(false)
-})
-
-// 2026-10-05 實例：家目錄 session 碰了別的 repo 的 worktree，worktree 長出自己的經驗檔
-test('碰到別的 repo 的 worktree：經驗寫到主工作樹那個專案', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  const WT = 'D:/repos/alpha-feat'
-  w.files.set(`${WT}/.git`, 'gitdir: D:/repos/alpha/.git/worktrees/alpha-feat\n')
-  repo(w, ALPHA)
-  await read($, `${WT}/a.ts`)
-  distillReply = actionsReply({ op: 'add_memory', project: 'P2', type: 'project', text: 'worktree 裡學到的事' })
-  await distillNow($)
-  expect(w.files.get(ALPHA_NOTES) ?? '').toContain('worktree 裡學到的事')
-  expect(w.files.has(`${CLAUDE_PROJECTS}/D--repos-alpha-feat/memory/ctx-handoff.md`)).toBe(false)
 })
 
 test('從 worktree 啟動、主工作樹還沒有經驗檔：建在主工作樹，不建在 worktree 的對話檔目錄', async ($, on) => {
@@ -1600,28 +1213,4 @@ test('從 worktree 啟動、主工作樹還沒有經驗檔：建在主工作樹�
   await distillNow($)
   expect(w.files.get(MAIN_NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
   expect(w.files.has(NOTES)).toBe(false)
-})
-
-test('沒碰到檔案的已知專案：提示只列開頭，可以新增進去，不能改它的條目', async ($, on) => {
-  const w = world(on, 100_000, 1_000_000, {}, [], 5)
-  w.files.set(NOTES, EXISTING)
-  w.files.set(ALPHA_NOTES, ALPHA_START)
-  w.files.set(`${CLAUDE_PROJECTS}/C--Users-u-AppData-Local-Temp-x/memory/ctx-handoff.md`, ALPHA_START)
-  distillReply = actionsReply(
-    { op: 'add_memory', project: 'P2', type: 'project', text: '只用 MCP 做的 alpha 工作' },
-    { op: 'update_memory', id: 'P2-M1', type: 'user', text: '不該改到' },
-    { op: 'move_memory', id: 'P1-M1', project: 'P2' },
-  )
-  await distillNow($)
-  const prompt = w.forks.find(f => f.includes('=== ACTIONS ===')) ?? ''
-  expect(prompt).toContain('P2 D--repos-alpha（這次沒碰到它的檔案')
-  expect(prompt).toContain('- [user] 甲')
-  expect(prompt).toContain('- 規則：規則一')
-  expect(prompt).not.toContain('AppData-Local-Temp')
-  const alpha = w.files.get(ALPHA_NOTES) ?? ''
-  expect(alpha).toContain('只用 MCP 做的 alpha 工作')
-  expect(alpha).toContain('- [user] 甲')
-  expect(alpha).not.toContain('不該改到')
-  expect(alpha).toContain('- [feedback] 舊 A')
-  expect(lastOf(w).rejected.samples[0]).toContain('P2 只列開頭')
 })

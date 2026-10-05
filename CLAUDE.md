@@ -23,8 +23,8 @@ node tools/status.mjs             # 確認各 session 已熱重載、看整理�
 - **整理用不帶歷史的單次請求**：`$.model.complete`（`DISTILL_MODEL`，effort low），只送上次錨點之後的對話片段（`$.session.messages()` 轉成純文字，工具輸入／結果截短，總長有上限），由程式驗證 JSONL 動作再寫檔。整理一開始就讀好片段，所以交接只等幾秒就能 `/clear`。不要改回 fork：fork 一定用主模型、整段前綴，快取一過期就全價重送。模型最低用 Sonnet 5.5 effort low（維護者決定，不用更小的模型）。
 - **交接仍用 `$.model.fork`**：handoff 需要整段 context。fork 沒有工具、沒有取消參數，時限只能用 `$.clock.after`＋`Promise.race`（原本的 fork 仍在背景跑完）。
 - **不自動送訊息通知 AI**：會多一次整段 context 的請求，離席時也會讓離席 handoff 被當成過時刪掉。整理有變動只跳 toast（寫完整路徑），差異用 `prompt.submit` 的 `context` 跟著下一則人類訊息帶入；不用 `session.append`（會插進進行中的回合）。
-- **經驗檔是各專案自己的工作紀錄**：`<claude>/projects/<專案>/memory/ctx-handoff.md`，不寫 `MEMORY.md`（內建 auto memory 開啟時會重複載入或改寫）。P1 是 session 啟動資料夾，依 `$.session.root()` 判斷（`$.session.repo()` 會跟著 Bash `cd` 變）；worktree 一律對到主工作樹。
-- **跨檔搬移兩階段寫入**：第一階段只寫「目的地原本內容＋搬入條目」，第二階段寫所有檔案最終版本，第一階段寫過的檔一律重寫；任一步失敗，條目至少還在一份檔案裡。改這段要用逐位置注入寫入失敗驗證。
+- **一個工作區一份經驗檔，不跨專案**：工作區是 session 啟動的資料夾（依 `$.session.root()`；`$.session.repo()` 會跟著 Bash `cd` 變），從 git worktree 啟動時算主工作樹。經驗檔在 `<claude>/projects/<編碼後的工作區路徑>/memory/ctx-handoff.md`，整理只寫它、新對話只帶入它；不追蹤 session 碰過的其他 repo，也不做跨檔搬移（維護者 2026-10-05 決定：多專案分檔造成分錯專案、worktree 對應、多個 session 互改別人檔案等問題）。不寫 `MEMORY.md`（內建 auto memory 開啟時會重複載入或改寫）。
+- **不留相容舊格式的程式**：格式或機制改了就直接改，不寫遷移或雙格式判斷；舊資料用 `tools/notes.mjs` 一次手動整理。
 - **背景失敗原因寫進 `$.store`** 並在 `/handoff` 狀態顯示：`$.ui.log` 在 `/clear` 之後不會留在對話檔。手動指令沒有回答時不要回報「完成」。
 - **指令名稱**：`/handoff` 被使用者自己的指令或 skill 佔用時，改註冊 `/ctx-handoff`。
 
