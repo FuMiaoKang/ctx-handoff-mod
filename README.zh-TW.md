@@ -2,131 +2,139 @@
 
 [English](README.md)
 
-一個 Claude Code mod，**自動**把太長的對話交接給新對話：主對話的 context 達到門檻時，它會產生一份 handoff 摘要，執行 `/clear`，再把 handoff 送進新對話，讓工作從原處接續。你離開時，它會幫你保溫 prompt 快取；到最後只存一份 handoff，不清除對話。它也會在背景整理對話裡學到的事（distill），寫進各專案的經驗檔，下次開新對話時自動帶入。正常使用時不必打任何指令。
+給長時間使用 Claude Code 的人的 mod。對話太長時，它會自己寫好 handoff、清空對話，在新對話接著做；同時在背景記下你糾正過、交代過的事，下次在同一個資料夾開對話時自動帶入。平常不需要打任何指令。
 
-**適合誰**：用 1M context 模型跑長時間 Claude Code session、而且用 Claude 訂閱登入（1 小時 prompt 快取）的人。**狀態**：實驗性。它建立在 Claude Code 仍屬 early access 的 function hooks API 上，Claude Code 改版時可能需要跟著調整。依賴它之前，請先讀[限制](#限制)。
+**適合誰**：用 1M context 模型跑長時間 session、用 Claude 訂閱登入（1 小時 prompt 快取），而且習慣在要工作的專案資料夾開 Claude Code 的人。
+**不適合**：用 API key、Bedrock 或 Vertex 的人（快取只有 5 分鐘，見[限制](#限制)），或希望某個專案的經驗跟著你到其他資料夾的人。
+**狀態**：實驗性。建立在 Claude Code 仍屬 early access 的 function hooks API 上，版本更新可能需要跟著改。訊息為繁體中文。
 
-## 背景整理（distill）：同一件事不用再講第四次
+## 你會得到什麼
 
-<img src="docs/distill-demo.gif" width="300" alt="distill 示範：同一件事講了三次，開新對話後被忘記；ctx-handoff 在背景把它整理成規則寫進經驗檔，下一個新對話就記得了">
+| 情境 | 沒有這個 mod | 有 ctx-handoff |
+|---|---|---|
+| context 到 600k（或較小視窗的 80%） | 很晚才發現，要自己寫摘要、自己 `/clear` | 自動寫 handoff、清空對話，新對話先回報它理解的現況，再等你指示 |
+| 離開一小時 | 1 小時 prompt 快取過期，下一則訊息要整段重讀 | 最多刷新快取 3 次（約 4 小時）；之後改存一份離席 handoff，你不在時不會清空對話 |
+| 同一件事在三個對話裡都講過 | 新對話又忘了 | 記成這個資料夾經驗檔裡的一條記憶或規則，下一段對話開頭自動帶入 |
+
+<img src="docs/distill-demo.gif" width="300" alt="distill 示範：同一件事講了三次，開新對話後被忘記；ctx-handoff 在背景把它整理成經驗檔裡的一條規則，下一段對話就記得了">
 
 （[完整畫質 MP4](docs/distill-demo.mp4)）
 
-你在對話裡糾正過、交代過的事，新對話通常就忘了。distill 只把上次整理之後新增的對話，用一次不帶工具的請求交給小模型（Sonnet 5.5，effort low），把值得留下的事整理成兩種條目：
+## 為什麼可以相信
 
-| 條目 | 內容 | 例子 |
-|---|---|---|
-| **記憶** | 你的偏好、專案的現況、外部資源的位置 | 「回報先講結論」「Staging 網址是 …」 |
-| **規則** | 可重複使用的做法，記錄出現次數；出現 2 次以上才帶入新對話，依次數排序 | 「Bash 路徑用正斜線（3 次）」 |
-
-- **不打斷你**：整理在背景跑，結果附在你的下一則訊息上，讓這次對話也馬上用得到。
-- **每次只是一個小請求**：只送新增的那段對話（工具輸入與結果會截短，總長有上限），交給 effort low 的 Sonnet 5.5，所以成本不會隨整段 context 變大，也不依賴快取還熱著。
-- **經驗跟著工作區**：在哪個資料夾開 Claude Code，就用那個資料夾的一份 `ctx-handoff.md`；從 git worktree 開的算主工作樹。整理只寫這一份，新對話也只帶入這一份，所以請在要工作的專案資料夾開 Claude Code。
-- **檔案是你的**：經驗檔是一般 Markdown，可以直接改，手動編輯會被保留。
-
-想立刻整理一次就打 `/handoff distill`；不想要可以用 `/handoff distill off` 關掉。
-
-## 它會做什麼
-
-三條路徑都只作用在主對話，子代理的回合一律略過。
-
-| 什麼時候 | 會發生什麼 | 你要做什麼 |
-|---|---|---|
-| **主對話停下來，且 context ≥ 600k**（或視窗的 80%，取較小者） | 在 Claude Code 的 `Stop` hook 觸發時判斷。如果還有背景工作、一次性排程或子代理在跑就先等（循環排程不算），等到硬上限（見下）為止。否則 fork 對話產生 handoff（同時平行做一次整理），接著 `/clear` 並送出 handoff。整理最多等到交接開始後 5 秒（它一開始就讀好對話片段），超過就不等，讓它在背景跑完。新對話會回報它理解的現況，然後等你指示。 | 不用 |
-| **閒置 55 分鐘** | fork 一個很小的請求刷新快取，最多 3 次（合計約 4 小時）。到第 4 次改成存一份「離席 handoff」，而且**不** `/clear`：你不在，所以不替你換對話。 | 不用 |
-| **離席 handoff 存好後你回來** | 先攔下你的第一則訊息，請你選擇。 | `/handoff resume` 開新對話，帶上 handoff 和這則訊息；`/handoff continue` 留在原本的對話。直接再送一則不同的訊息，則在原本的對話連同先前攔下的那則一起送出。如果舊對話自己往前走了（回合完成、而且沒有攔下的訊息），離席 handoff 會被視為過時而刪除。 |
-
-### 值得知道的行為
-
-- **交接期間打的訊息不會遺失。** 從門檻交接或 `/handoff now` 開始，到 handoff 送出為止，你送的訊息會先被攔下並顯示提示，提示會寫出已經進行幾秒（通常 1 分鐘內完成，最長約 3 分鐘）。同樣的內容重送只會暫存一次。只能暫存文字：圖片等附件要等交接完成後重新貼上，提示會說明。攔下的訊息會接在 handoff 文字後面一起送出；文字建好之後才到的，會在 handoff 那一輪之後緊接著送出；如果在 `/clear` 之前就失敗，會在原本的對話重新送出。（斜線指令照常通過；`/handoff dry` 與離席 handoff 的產生過程不會攔訊息。）
-- **背景整理的結果跟著你的下一則訊息。** 整理出的差異先排在記憶體裡，附加在下一則真正進入對話的訊息上，當作額外參考。被丟棄的訊息和斜線指令不會消耗它。整理有變動時會跳出提示，寫出變動項數與經驗檔的完整路徑；在你送出下一則訊息之前，不會送任何東西給模型。交接前的那次整理不排入。
-- **整理輸出是 JSONL，由程式套用。** 背景整理是一次不帶工具、交給 `DISTILL_MODEL` 的請求。它在 `=== ACTIONS ===` 與 `=== END ===` 之間，一行輸出一個 JSON 動作（`add_memory`、`update_memory`、`delete_memory`、`add_rule`、`confirm_rule`、`update_rule`、`delete_rule`），一律用繁體中文（台灣），程式碼、指令、路徑、錯誤訊息與專有名詞維持原文。程式逐行驗證（op、必要的字串欄位、`type` 屬於 user|feedback|project|reference、編號存在）；無效的行丟棄並計數，最多保留 3 個樣本，顯示在 `/handoff`；每個樣本附丟棄原因（JSON 格式錯誤、缺欄位、編號不存在等）和該行的頭尾。任何欄位疑似金鑰的動作整個丟棄，樣本也不存內容。
-- **一個工作區一份經驗檔。** 工作區是 session 啟動的資料夾（依 `$.session.root()`，Bash `cd` 不會改變它），從 git worktree 啟動時算主工作樹。整理提示只列這個工作區的記憶與規則（`M3`、`R1`），也只寫它的 `ctx-handoff.md`；session 碰到的其他 repo 不追蹤。整理期間經驗檔被改過，就整批不寫、記下錯誤，下次重新整理同一段。
-- **失敗看得到、救得回來。** 每次交接失敗（產生、`/clear`、送出）都會記錄，並顯示在 `/handoff`。handoff 的 fork 超過 3 分鐘沒有回應就放棄，攔下的訊息送回原本的對話；整理請求超過 8 分鐘就放棄。`/handoff resume` 時 `/clear` 失敗，離席 handoff 和攔下的訊息會保留，可以再選一次。門檻交接失敗後，要再過 3 則使用者訊息或 10 分鐘才會重試。完整文字會在 `/clear` 之前先存成 `pendingSubmit:<session id>`，送出成功才刪；送出失敗時，用 `/handoff resend` 重新送出，不會再 `/clear`。
-- **store 的鍵依工作區區分。** handoff 紀錄與整理狀態按工作區分開，`/handoff` 只顯示目前工作區的資訊。每個 session 一把的鍵在第一次出現 30 天後清除。`refresh` 與 `distill` 開關仍是全域的。
-- **手動編輯經驗檔不會被吃掉。** 多行的記憶條目、不認得的 `## ` 區段與其餘內容，經過整理後會原樣保留。同名的新規則會被略過。`/handoff` 會顯示超過帶入上限 40 條而沒被帶入的記憶數。
-- **延後有硬上限。** 背景工作讓交接一直等時，context 達到 `min(視窗的 90%, 門檻 + 150k)` 就照樣交接，並在 handoff 開頭註明當時還有什麼在跑。
-
-目前的證據：
-- 用 probe mod 實際驗證過幾個基本元件：mod 可以執行 `/clear` 後接著 `prompt.submit`；對 102k token 的對話做 fork 時，102,523 個輸入 token 中有 102,003 個是從快取讀取（約 99.5%）。
-- `claude plugin test`：71/71 通過。涵蓋用 `model.complete` 整理且只送錨點之後的片段、一個工作區一份經驗檔（碰到的其他 repo 不寫）、JSONL 驗證與附原因的丟棄樣本、`/handoff` 被使用者 skill 佔用、fork 與整理的逾時、交接前整理最多等 5 秒、攔下訊息去重與附件、Bash `cd` 不會改變工作區、git worktree 用主工作樹的經驗檔、跳脫寫法的金鑰不會存下、整理期間經驗檔被改就略過、resume 時 `/clear` 失敗、門檻觸發、200k 視窗、刷新後存離席 handoff、關閉刷新、context 太小時略過、resume、交接期間攔訊息、背景整理差異的帶入、store 清理、失敗重試間隔與 `/handoff resend`、用真實經驗檔複本驗證解析與輸出、以 `Stop` 為準的延後（背景工作、一次性排程、循環排程、硬上限、子代理），以及離席流程。
-- 實機確認過（2026-10-04）：整理輸出 JSONL 並以繁體中文寫入；整理差異跟著下一則訊息帶入，模型看得到；交接期間攔下的訊息有附在新對話第一則；context 超過硬上限時，即使有背景工作和子代理在跑也會交接。
-- 還沒實際觀察到的：閒置刷新是否真的能讓 1 小時快取延續。見[限制](#限制)。
+- **測試**：`claude plugin test` 71/71 通過，涵蓋門檻與視窗大小、背景工作還在跑時延後、交接期間攔下的訊息、離席流程、整理輸出的驗證、金鑰過濾、整理期間經驗檔被改，以及各種失敗的復原。
+- **實測整理成本（2026-10-05）**：整理只把上次之後新增的對話交給 effort low 的 Sonnet 5.5。一段短的測試對話是輸入 1,176 token、輸出 91 token、1.6 秒。舊設計每次用主模型 fork 整段對話，輸入 20.5 萬～33.5 萬 token、29～108 秒。
+- **真實 session 確認過**：整理會寫入經驗檔，變動跟著下一則訊息送到模型；交接期間打的訊息會跟 handoff 一起送進新對話；超過硬上限時，即使有背景工作和子代理在跑也會交接；資料夾裡已有自己的 `handoff` skill 時，會改用 `/ctx-handoff`。
+- **還沒實際觀察到**：閒置刷新是否真能延續 1 小時快取，以及交接前那次整理是否一定能跨過 `/clear` 跑完（見[限制](#限制)）。
 
 ## 快速開始
 
-需要支援 function hooks（mod）的 Claude Code 版本。開發與測試用的是 2.1.287。
+需要支援 function hooks（mod）的 Claude Code。開發與測試用的是 2.1.287～2.1.289。
 
 ```sh
 git clone https://github.com/cablate/ctx-handoff-mod ~/.claude/mods/ctx-handoff
 claude --plugin-dir ~/.claude/mods/ctx-handoff
 ```
 
-在 session 裡執行 `/handoff`，應該會看到類似：
+在這個 session 打 `/handoff`，應該會看到類似：
 
 ```
 [ctx-handoff] context 12034 / 門檻 600000（視窗 1000000）
 快取刷新 on，本次閒置已刷新 0/3，計時器未啟動
 ```
 
-想讓每個 session 都自動載入，在 `~/.claude/settings.json` 的 `env` 加上絕對路徑。有多個資料夾時，Windows 用 `;` 分隔，macOS/Linux 用 `:`：
+要每個 session 都載入，在 `~/.claude/settings.json` 的 `env` 加上絕對路徑（多個資料夾在 Windows 用 `;` 分隔，macOS／Linux 用 `:`）：
 
 ```json
 "env": { "CLAUDE_CODE_PLUGIN_DIRS": "/home/you/.claude/mods/ctx-handoff" }
 ```
 
+### 從 0.1 升級
+
+0.2 改成**一個工作區一份經驗檔**，而且不留相容舊版的程式：
+
+- session 碰到其他 repo 時，不再把經驗寫進那些 repo，也不再帶入它們的經驗。請在要工作的專案資料夾開 Claude Code。
+- store 裡的舊鍵（`projdir:*`、`migrated:*`、全域的 `handoffs`）不再使用，可以刪除。
+- 舊版分錯資料夾的經驗不會自動搬，要手動搬，或用 `node tools/notes.mjs`（見 [`tools/README.md`](tools/README.md)）。
+
+## 運作方式
+
+以下都只看主對話，子代理的回合會略過。
+
+| 時機 | 會發生什麼 | 你要做的事 |
+|---|---|---|
+| **對話停下來，且 context ≥ 600k**（或視窗的 80%，取較小者） | 在 Claude Code 的 `Stop` hook 觸發時判斷。如果還有背景工作、一次性排程或子代理在跑，就先等（循環排程不算），最多等到硬上限 `min(視窗的 90%, 門檻 + 150k)`。接著 fork 對話寫 handoff，執行 `/clear`，再送出 handoff。 | 不用做事 |
+| **閒置 55 分鐘** | 用一個很小的 fork 刷新快取，最多 3 次。到第 4 次改存離席 handoff，而且**不** `/clear`。 | 不用做事 |
+| **離席 handoff 之後回來** | 先攔下你的第一則訊息，請你選擇。 | `/handoff resume` 開新對話，帶上 handoff 和你的訊息；`/handoff continue` 留在舊對話。 |
+
+### 經驗檔（背景整理）
+
+工作區是 session 啟動的資料夾；從 git worktree 啟動時算主工作樹。經驗檔在 `~/.claude/projects/<編碼後的資料夾路徑>/memory/ctx-handoff.md`，是可以直接編輯的一般 Markdown。
+
+| 條目 | 內容 | 帶入新對話 |
+|---|---|---|
+| **記憶** | 偏好、決定與限制、外部資源的位置 | 最新 40 條 |
+| **規則** | 可重複使用的做法與出現次數，例如「Bash 路徑用正斜線（3 次）」 | 出現 2 次以上、依次數取前 15 條 |
+
+- **什麼時候跑**：每 30 則訊息、閒置刷新時、存離席 handoff 前、門檻交接前。`/handoff distill` 立刻跑一次；`/handoff distill off` 關掉。
+- **送出什麼**：只有上次整理之後的對話（轉成純文字，工具輸入與結果截短，總長上限 30 萬字），加上這個工作區現有的經驗。一次交給 `DISTILL_MODEL`（Sonnet 5.5，effort low）的請求，不帶工具。
+- **怎麼套用**：模型每行輸出一個 JSON 動作（`add_memory`、`update_memory`、`delete_memory`、`add_rule`、`confirm_rule`、`update_rule`、`delete_rule`），mod 逐行驗證；無效的行和疑似金鑰的內容會丟棄、計數，顯示在 `/handoff`。請求期間經驗檔被改過，就整批不寫，下次重新整理同一段。
+- **怎麼看到**：跳出提示，寫出變動幾項和檔案的完整路徑。變動會跟著你的下一則訊息當成補充資訊帶入，不會自己送訊息給模型。
+
+### 值得知道的行為
+
+- **交接期間打的訊息不會不見**：會先攔下並提示（交接已進行幾秒，通常不到 1 分鐘），再跟 handoff 一起送出；同樣的內容只暫存一次。附件無法暫存，要在交接後重新貼上，提示會說明。
+- **失敗看得到**：交接失敗（產生、`/clear`、送出）都會記錄，顯示在 `/handoff`。handoff 的 fork 超過 3 分鐘就放棄，攔下的訊息送回舊對話；整理請求超過 8 分鐘就放棄。門檻交接失敗後，要再等 3 則訊息或 10 分鐘才重試。handoff 全文會在 `/clear` 前先存好，送出失敗時可以用 `/handoff resend` 重送。
+- **紀錄依工作區分開**：最近 5 份 handoff 與整理狀態依工作區存在 mod 的 store；每個 session 的鍵 30 天後清掉。`refresh` 與 `distill` 開關是全域的。
+
 ## 指令
 
-正常使用時用不到這些。
-
-只有一個指令 `/handoff`，用子指令區分。如果你自己的指令或 skill 已經叫 `/handoff`，mod 會改註冊 `/ctx-handoff`。
+平常用不到。如果你自己的指令或 skill 已經叫 `/handoff`，mod 會改註冊 `/ctx-handoff`。
 
 | 指令 | 用途 |
 |---|---|
-| `/handoff` | 查看 context 用量、門檻、刷新與背景整理狀態、有沒有待處理的離席 handoff，並列出用法 |
+| `/handoff` | 查看 context 用量、門檻、刷新與整理狀態、待處理的離席 handoff，並列出用法 |
 | `/handoff now` | 立刻交接（會清除目前對話） |
-| `/handoff dry` | 試產一份 handoff 並顯示用量，不清除對話 |
-| `/handoff distill` | 立刻整理本專案的記憶與規則 |
-| `/handoff resume` | 使用離席 handoff：先 `/clear`，再送出 handoff 和剛才被攔下的訊息 |
-| `/handoff continue` | 放棄離席 handoff，在原本的對話送出被攔下的訊息 |
-| `/handoff resend` | 重新送出沒送達的 handoff（優先用這個 process 自己的紀錄，否則用它最近產生的那份）。不會 `/clear` |
-| `/handoff refresh on\|off` | 開關閒置時的快取刷新。關閉時，閒置 55 分鐘就直接存離席 handoff |
+| `/handoff dry` | 試產一份 handoff 並顯示花費，不清除對話 |
+| `/handoff distill` | 立刻整理這個工作區的經驗 |
+| `/handoff resume` | 使用離席 handoff：`/clear` 後送出它和攔下的訊息 |
+| `/handoff continue` | 放棄離席 handoff，在舊對話送出攔下的訊息 |
+| `/handoff resend` | 重送沒送達的 handoff，不再 `/clear` |
+| `/handoff refresh on\|off` | 開關閒置時的快取刷新；關閉時，閒置 55 分鐘就直接存離席 handoff |
 | `/handoff distill on\|off` | 開關背景整理 |
-
-最近 5 份 handoff 會保存在 mod 的 store 裡。
 
 ## 設定
 
-數值是 [`hooks/register.ts`](hooks/register.ts) 開頭的常數，直接改那裡即可；資料夾有被監看時，存檔就會熱重載。
+數值是 [`hooks/register.ts`](hooks/register.ts) 開頭的常數；資料夾用 `CLAUDE_CODE_PLUGIN_DIRS` 載入時，改完會自動熱重載。
 
-| 常數 | 預設 | 意義 |
+| 常數 | 預設 | 意思 |
 |---|---|---|
 | `THRESHOLD` | `600_000` | 觸發交接的 context token 數 |
 | `WINDOW_RATIO` | `0.8` | 視窗較小時，門檻改成「視窗 × 這個比例」 |
 | `IDLE_MS` | 55 分鐘 | 閒置多久後刷新（依 1 小時快取設定） |
 | `MAX_REFRESH` | `3` | 存離席 handoff 前最多刷新幾次 |
-| `MIN_TOKENS` | `30_000` | context 低於這個值時，不刷新也不存離席 handoff |
-| `DISTILL_MODEL` | `claude-sonnet-5-5` | 背景整理用的模型（搭配 `DISTILL_EFFORT` `low`）；只送上次整理之後的對話 |
+| `MIN_TOKENS` | `30_000` | context 低於這個值時，不刷新、不背景整理、不存離席 handoff |
+| `DISTILL_MODEL` | `claude-sonnet-5-5` | 整理用的模型，搭配 `DISTILL_EFFORT` `low` |
 
-關於門檻：社群回報和 Anthropic 自己公布的 MRCR 數據都顯示，品質大約在 200k–300k 左右開始下滑。設 600k 是刻意的選擇，為了減少交接的次數。如果你發現還沒交接模型就開始變差，就把門檻調低。
+關於門檻：社群回報和 Anthropic 的 MRCR 數據都顯示，品質大約在 200k～300k token 開始下滑。600k 是刻意選的，為了少交接幾次；如果發現交接前模型已經變差，就調低它。
 
 ## 限制
 
-- **5 分鐘快取的使用者應關閉刷新。** 用 API key、Bedrock、Vertex，或訂閱已超出額度、開始扣 usage credits 時，prompt 快取只有 5 分鐘。這時第 55 分鐘的刷新會發現快取早就過期，而且每次刷新都會重寫整段 context。請執行 `/handoff refresh off`。mod 不會自動偵測 TTL。
-- **閒置刷新還沒驗證。** 還不確定 fork 讀取快取時，能不能延長主對話那份 1 小時快取的時效。
-- **背景工作的判斷靠 `Stop` hook 的快照。** 哪些 `status` 算「還在跑」、`Stop` 與 `turn.complete` 在真實 session 的先後，都還沒實測確認。永遠不會結束的工作（例如 dev server）只會讓交接延後到硬上限；需要時可以用 `/handoff now` 提早強制交接。
-- **交接前的整理會跨過 `/clear`。** 它一開始就讀好要整理的對話片段，所以交接最多等它 5 秒就 `/clear`。`/clear` 之後已送出的請求能不能跑完，還沒實測確認；如果不能，那次整理會記錄為失敗，顯示在 `/handoff`。
-- **被攔下的訊息只保留文字。** mod 只看得到附件的類型、拿不到內容，所以交接期間或離席 handoff 後送出的圖片要重新貼上，提示會說明。測試用 composer 來源的送出模擬使用者輸入，不是真實的終端機。
-- **熱重載會重置**計時器和記憶體內的狀態（攔下的訊息、排入的整理差異、重送紀錄）。
-- **API 還在 early access。** Claude Code 更新後可能需要跟著修改。
+- **5 分鐘快取的使用者要關掉刷新。** 用 API key、Bedrock、Vertex，或訂閱已超出額度、開始扣 usage credits 時，快取只有 5 分鐘，第 55 分鐘的刷新會整段重寫。請執行 `/handoff refresh off`；mod 不會自動偵測快取時效。
+- **閒置刷新還沒驗證。** 還不確定 fork 讀取快取能不能延長主對話那份 1 小時快取。
+- **經驗只留在一個資料夾。** 在家目錄做的工作就記在家目錄，即使內容是別的專案。
+- **交接前的整理會跨過 `/clear`。** 它先讀好對話片段，所以交接最多只等它 5 秒。`/clear` 之後請求能不能跑完還沒確認；如果不能，會記錄為失敗並顯示在 `/handoff`。
+- **背景工作的判斷靠 `Stop` hook 的快照。** 永遠不會結束的工作（例如 dev server）只會讓交接延到硬上限；需要時用 `/handoff now` 提早交接。
+- **熱重載會重置計時器和記憶體內的狀態**（攔下的訊息、排入的經驗差異、重送紀錄）。
+- **API 還在 early access。** Claude Code 更新後可能需要跟著改。
 
 ## 開發
 
-開發流程、設計決定與實測過的平台事實見 [`CLAUDE.md`](CLAUDE.md)，工具一覽見 [`tools/README.md`](tools/README.md)。
+開發流程、設計決定與實測過的平台事實在 [`CLAUDE.md`](CLAUDE.md)；工具一覽在 [`tools/README.md`](tools/README.md)。
 
 ```sh
 node tools/wt.mjs new <分支>      # 在暫存 worktree 改，不動熱重載中的主資料夾
-node tools/check.mjs              # validate、測試、tsc、公開資訊掃描
+node tools/check.mjs              # validate、測試、tsc、工具測試、公開資訊掃描
 node tools/wt.mjs land <分支>     # 再檢查一次，通過才 fast-forward 回主資料夾
 node tools/status.mjs             # 經驗檔大小、最近整理與失敗、各 session 的熱重載
 ```

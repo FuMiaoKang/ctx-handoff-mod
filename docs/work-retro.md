@@ -21,8 +21,8 @@
 | 層 | 規模 |
 |---|---|
 | 經驗檔（每次對話載入） | 家目錄 10 條記憶／0 條規則（5.2 KB）；ctx-handoff 專案 1／0（0.8 KB）；另兩個專案 27／16（28.4 KB）、32／10（46.0 KB） |
-| repo 追蹤檔 | 21 個；`CLAUDE.md`＋`tools/` 共 491 行 |
-| repo 外的 ctx-handoff 檔案 | `settings.json` 的 `CLAUDE_CODE_PLUGIN_DIRS`、store 一個檔、各專案經驗檔（其餘已清除） |
+| repo 追蹤檔 | 22 個；`hooks/register.ts` 1217 行（0.1 版 1582 行）；測試 71 個；`CLAUDE.md`＋`tools/` 共 492 行 |
+| repo 外的 ctx-handoff 檔案 | `settings.json` 的 `CLAUDE_CODE_PLUGIN_DIRS`、store 一個檔（舊機制的鍵已清除）、各工作區經驗檔；舊的 dev-mods 連結、探測 mod 與備份資料夾已清除 |
 
 ## 4. 本專案改過的預設值
 
