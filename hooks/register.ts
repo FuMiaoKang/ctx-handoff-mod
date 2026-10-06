@@ -23,6 +23,8 @@ const DISTILL_GRACE_MS = 5_000
 const DISTILL_MODEL = 'claude-sonnet-5-5'
 const DISTILL_EFFORT = 'low'
 const DISTILL_MAX_TOKENS = 32_000
+// 自動整理失敗後的冷卻：不推進進度時，避免每個回合都重送整段對話片段
+const DISTILL_RETRY_MS = 10 * 60_000
 // 對話片段的字數上限（超過時保留最新的部分）；單一工具輸入／結果各自截短
 const TRANSCRIPT_MAX_CHARS = 300_000
 const TOOL_INPUT_CHARS = 300
@@ -575,6 +577,8 @@ async function clearAndSubmit($: EngineInterface, text: string) {
 let distilling = false
 // 上一次整理有沒有失敗（有回答但沒套用也算），給 /autohandoff distill 判斷
 let distillFailed = false
+// 自動整理（每 N 則）在這個時間之前不重試；undefined＝沒有冷卻
+let distillRetryAt: number | undefined
 
 const slash = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
 const encodeProject = (p: string) => slash(p).replace(/[^A-Za-z0-9]/g, '-')
@@ -671,6 +675,7 @@ async function distill($: EngineInterface, why: string, queue = true) {
   distillFailed = false
   const fail = async (reason: string) => {
     distillFailed = true
+    distillRetryAt = (await $.clock.now()) + DISTILL_RETRY_MS
     $.ui.log(`${tag} 背景整理失敗（${why}）：${reason}`)
     await $.store.set(`distill:error:${await projectKey($)}`, { at: await $.clock.now(), why, reason })
   }
@@ -705,11 +710,13 @@ async function distill($: EngineInterface, why: string, queue = true) {
       $.ui.log(`${tag} 背景整理（${why}）${reason}`)
       await $.store.set(`distill:error:${await projectKey($)}`, { at: now, why, reason })
       distillFailed = true
+      distillRetryAt = now + DISTILL_RETRY_MS
       return r
     }
     const { notes: updated, changes } = applyActions(actions, notes, stamp.slice(0, 10))
     if (changes.length > 0) await $.fs.write(file, renderNotes(updated, stamp))
     await $.store.set(key, { turn: turns, at: now, anchor })
+    distillRetryAt = undefined
     await touchSeen($, key)
     const usage = describeUsage({ input: r.usage.input_tokens, cacheRead: r.usage.cache_read_input_tokens, cacheCreation: r.usage.cache_creation_input_tokens, output: r.usage.output_tokens, ms: now - started })
     await $.store.set(`distill:last:${await projectKey($)}`, { at: now, why, changes, file, usage, rejected } satisfies DistillLast)
@@ -930,6 +937,7 @@ function resetState() {
   pendingToasted = false
   lastHandoff = undefined
   retryAfter = undefined
+  distillRetryAt = undefined
   snapshot = undefined
   deferral = undefined
   deferToasted = false
@@ -1004,7 +1012,8 @@ export const register: Register = on => {
     // 每 DISTILL_EVERY 則使用者訊息，趁快取熱整理一次
     if ((context.tokens ?? 0) >= MIN_TOKENS && !distilling && (await isDistillOn($))) {
       const last = ((await $.store.get(`distill:${await $.session.id()}`)) as { turn: number } | undefined)?.turn ?? 0
-      if ((await $.session.turns()) - last >= DISTILL_EVERY) {
+      const cooling = distillRetryAt !== undefined && (await $.clock.now()) < distillRetryAt
+      if (!cooling && (await $.session.turns()) - last >= DISTILL_EVERY) {
         $.clock.after(0, () => void distill($, `每 ${DISTILL_EVERY} 則`))
       }
     }

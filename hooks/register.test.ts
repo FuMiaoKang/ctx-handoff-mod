@@ -1245,6 +1245,27 @@ test('handoff 用 markdown 粗體開頭也算合格；內含的金鑰在送出�
   expect(w.submits[0]).not.toContain('ghp_')
 })
 
+test('自動整理失敗後冷卻 10 分鐘：期間的回合不重送，冷卻過後才重試', async ($, on) => {
+  let n = 30
+  const w = world(on, 100_000, 1_000_000, {}, [], () => n)
+  completeAborts = true
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.completes.length).toBe(1)
+  n = 31
+  await endTurn($)
+  await w.clock.advance(0)
+  n = 32
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.completes.length).toBe(1)
+  await w.clock.advance(10 * 60_000)
+  n = 33
+  await endTurn($)
+  await w.clock.advance(0)
+  expect(w.completes.length).toBe(2)
+})
+
 test('送給整理模型的對話片段：金鑰與密碼值先遮蔽，一般文字保留', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, {}, [], 5)
   await say($, '幫我測 API，Authorization: Bearer abcdefghijklmnopqrstuvwxyz，DB 是 postgres://admin:hunter2pass@db.local/app')
