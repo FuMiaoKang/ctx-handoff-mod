@@ -104,7 +104,40 @@ function localStamp(ms: number) {
   return d.toISOString().slice(0, 16).replace('T', ' ')
 }
 
-const SECRETISH =/(sk-[A-Za-z0-9]|gh[pousr]_|xox[bp]-|AKIA[0-9A-Z]|-----BEGIN|password|passwd|api[_-]?key|token\s*[:=]|secret\s*[:=])/i
+// 已知格式的金鑰本體：送給模型的對話片段、handoff、錨點都先把這些換成 SECRET_MASK
+const SECRET_VALUES: RegExp[] = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
+  /\b(?:sk|rk)-[A-Za-z0-9_-]{16,}/g,
+  /\b(?:sk|rk|pk)_(?:live|test)_[A-Za-z0-9]{10,}/g,
+  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
+  /\bglpat-[A-Za-z0-9_-]{16,}/g,
+  /\bxox[abposr]-[A-Za-z0-9-]{10,}/g,
+  /\bxapp-[A-Za-z0-9-]{10,}/g,
+  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
+  /\bAIza[0-9A-Za-z_-]{30,}/g,
+  /\bnpm_[A-Za-z0-9]{30,}/g,
+  /\bhf_[A-Za-z0-9]{30,}/g,
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g,
+]
+// 只遮值、保留前綴的寫法：Bearer、連線字串的密碼、key=value／"key": "value"
+const SECRET_PAIRS: [RegExp, string][] = [
+  [/\b(Bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/gi, '$1'],
+  [/\b([a-z][a-z0-9+.-]*:\/\/[^\s:/@]+:)[^\s@/]+(?=@)/gi, '$1'],
+  [/(["']?(?:password|passwd|secret|token|api[_ -]?key|access[_-]?key|client[_-]?secret|private[_-]?key)["']?\s*[:=]\s*["']?)[^\s"',;}]{6,}/gi, '$1'],
+]
+const SECRET_MASK = '［已遮蔽］'
+
+function redact(text: string) {
+  let out = text
+  for (const re of SECRET_VALUES) out = out.replace(re, SECRET_MASK)
+  for (const [re, keep] of SECRET_PAIRS) out = out.replace(re, `${keep}${SECRET_MASK}`)
+  return out
+}
+
+// 寫進經驗檔的動作：已知格式的金鑰，或看起來在講金鑰的字眼，就整行丟棄（寧可誤殺）
+const SECRET_WORDS = /(sk-[A-Za-z0-9]|gh[pousr]_|github_pat_|glpat-|xox[abposr]-|AKIA[0-9A-Z]|ASIA[0-9A-Z]|AIza|-----BEGIN|password|passwd|api[_ -]?key|access[_-]?key|client[_-]?secret|private[_-]?key|bearer\s|token["']?\s*[:=]|secret["']?\s*[:=])/i
+const isSecretish = (v: string) => SECRET_WORDS.test(v) || redact(v) !== v
 
 // ---------- 專案經驗檔：一份 md，記憶與規則 ----------
 const NOTES_HEAD = '# ctx-handoff 專案經驗'
@@ -244,7 +277,7 @@ function toAction(o: Record<string, unknown>, notes: Notes): Action | string {
 
 // 任何一層的字串值疑似金鑰（值是解析後的，跳脫寫法也看得到）
 const hasSecret = (v: unknown): boolean =>
-  typeof v === 'string' ? SECRETISH.test(v)
+  typeof v === 'string' ? isSecretish(v)
     : Array.isArray(v) ? v.some(hasSecret)
       : v !== null && typeof v === 'object' ? Object.values(v).some(hasSecret)
         : false
@@ -261,7 +294,7 @@ function parseActions(text: string, notes: Notes): { actions: Action[]; rejected
   // secret：解析後的值疑似金鑰。值可能是跳脫寫法（\u0073k-…），原始行比對不到，所以不能只靠再比對一次
   const reject = (why: string, line = '', secret = false) => {
     rejected.count += 1
-    if (rejected.samples.length < 3) rejected.samples.push(secret || SECRETISH.test(line) ? `${why}：（內容不記錄）` : sampleOf(why, line))
+    if (rejected.samples.length < 3) rejected.samples.push(secret || isSecretish(line) ? `${why}：（內容不記錄）` : sampleOf(why, line))
   }
   const start = text.indexOf(ACTIONS_START)
   if (start === -1) {
@@ -586,7 +619,7 @@ async function isDistillOn($: EngineInterface) {
   return (await $.store.get('distill')) !== false
 }
 
-const anchorOf = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 30)
+const anchorOf = (text: string) => redact(text).replace(/\s+/g, ' ').trim().slice(0, 30)
 
 type Row = { role: 'user' | 'assistant'; text: string; toolUses: readonly { tool: string; input: Record<string, unknown>; text?: string; isError?: true }[] }
 const clip = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…（截短，原長 ${s.length} 字）` : s)
@@ -599,7 +632,7 @@ function transcriptOf(rows: readonly Row[], anchor: string | undefined) {
   if (anchor) {
     for (let i = rows.length - 1; i >= 0; i--) {
       const r = rows[i]
-      if (r?.role === 'user' && r.text.replace(/\s+/g, ' ').includes(anchor)) { start = i + 1; found = true; break }
+      if (r?.role === 'user' && redact(r.text).replace(/\s+/g, ' ').includes(anchor)) { start = i + 1; found = true; break }
     }
   }
   const lines: string[] = []
@@ -611,7 +644,7 @@ function transcriptOf(rows: readonly Row[], anchor: string | undefined) {
       lines.push(`　〔工具 ${u.tool}〕${clip(JSON.stringify(u.input), TOOL_INPUT_CHARS)}${out}`)
     }
   }
-  let text = lines.join('\n')
+  let text = redact(lines.join('\n'))
   if (text.length > TRANSCRIPT_MAX_CHARS) text = `（前面省略 ${text.length - TRANSCRIPT_MAX_CHARS} 字）\n${text.slice(-TRANSCRIPT_MAX_CHARS)}`
   return { text, found }
 }

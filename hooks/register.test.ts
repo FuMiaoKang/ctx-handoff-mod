@@ -1216,3 +1216,15 @@ test('從 worktree 啟動、主工作樹還沒有經驗檔：建在主工作樹�
   expect(w.files.get(MAIN_NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
   expect(w.files.has(NOTES)).toBe(false)
 })
+
+test('送給整理模型的對話片段：金鑰與密碼值先遮蔽，一般文字保留', async ($, on) => {
+  const w = world(on, 100_000, 1_000_000, {}, [], 5)
+  await say($, '幫我測 API，Authorization: Bearer abcdefghijklmnopqrstuvwxyz，DB 是 postgres://admin:hunter2pass@db.local/app')
+  await say($, '設定檔寫 {"password": "s3cretValue!", "api_key": "AIzaSyA1234567890abcdefghijklmnopqrstu"}，順便看看 password 欄位的驗證')
+  await distillNow($)
+  const sent = w.forks[w.forks.length - 1] ?? ''
+  expect(sent).not.toMatch(/abcdefghijklmnopqrstuvwxyz|hunter2pass|s3cretValue|AIzaSy/)
+  expect(sent).toContain('Bearer ［已遮蔽］')
+  expect(sent).toContain('postgres://admin:［已遮蔽］@db.local/app')
+  expect(sent).toContain('password 欄位的驗證')
+})
