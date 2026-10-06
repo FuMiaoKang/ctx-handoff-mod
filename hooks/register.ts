@@ -513,6 +513,15 @@ async function makeHandoff($: EngineInterface, kind: Kind, tokens: number | null
     await recordFailure($, kind, tokens, `產生失敗：${forkFailure(r.reason)}`)
     return undefined
   }
+  // 模型回空白、拒絕或沒照格式：不能拿它 /clear，記成失敗、留在原本的對話
+  const text = redact(r.text.trim())
+  if (!/^[\s*#>_`]*HANDOFF[:：]\s*\S/.test(text)) {
+    const reason = `內容不合格（不是 HANDOFF: 開頭或沒有內容）：${clip(text.replace(/\s+/g, ' '), 80) || '（空白）'}`
+    $.ui.log(`${tag} handoff 產生失敗：${reason}`)
+    $.ui.toast(`${tag} handoff 內容不合格，這次不交接`)
+    await recordFailure($, kind, tokens, reason)
+    return undefined
+  }
   const at = await $.clock.now()
   const usage: Usage = {
     input: r.usage.input_tokens,
@@ -521,13 +530,13 @@ async function makeHandoff($: EngineInterface, kind: Kind, tokens: number | null
     output: r.usage.output_tokens,
     ms: at - started,
   }
-  const saved: Saved = { at, sessionId: await $.session.id(), kind, tokens, text: r.text, usage }
+  const saved: Saved = { at, sessionId: await $.session.id(), kind, tokens, text, usage }
   const handoffsKey = `handoffs:${await projectKey($)}`
   const list = ((await $.store.get(handoffsKey)) as Saved[] | undefined) ?? []
   await $.store.set(handoffsKey, [...list, saved].slice(-KEEP))
-  lastHandoff = { text: r.text }
+  lastHandoff = { text }
   $.ui.log(`${tag} handoff（${kind}）${describeUsage(usage)}`)
-  return r.text
+  return text
 }
 
 // $.prompt.submit 被別的 hook 丟棄時只回 { drop }、不會丟例外：沒送進對話，當成失敗

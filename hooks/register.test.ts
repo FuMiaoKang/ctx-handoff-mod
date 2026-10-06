@@ -16,6 +16,8 @@ const DISTILL_REPLY = actionsReply(
   { op: 'add_rule', name: '先實測再下結論', rule: '宣稱現行行為前先跑一次最小實測', applies: 'API 行為不確定時', not_applies: '文件已明確保證時', evidence: 'fork 能否讀寫靠實測才確定' },
 )
 let distillReply = DISTILL_REPLY
+// handoff fork 的回答：預設合格；測不合格或含金鑰的內容時改掉
+let handoffReply = 'HANDOFF: 測試'
 let onFork: (() => void | Promise<void>) | undefined
 // 整理請求回 aborted（引擎依 timeoutMs 放棄）
 let completeAborts = false
@@ -56,6 +58,7 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
   const files = new Map<string, string>([['C:/Users/u/.claude/projects/C--proj/S1.jsonl', '']])
   const logs: string[] = []
   distillReply = DISTILL_REPLY
+  handoffReply = 'HANDOFF: 測試'
   onFork = undefined
   completeAborts = false
   takenCommands = new Set()
@@ -124,7 +127,7 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
     if (isDistill) await distillGate?.()
     else await handoffGate?.()
     if (!isDistill && failHandoff) return { value: { isAnswered: false as const, reason: 'nothing-to-fork' as const } }
-    const text = isDistill ? distillReply : 'HANDOFF: 測試'
+    const text = isDistill ? distillReply : handoffReply
     return { value: { isAnswered: true as const, text, usage: usage(tokens) } }
   })
   // 背景整理走 model.complete：記進同一個 forks 清單（系統提示＋訊息），測試照舊比對內容與次數
@@ -1215,6 +1218,31 @@ test('從 worktree 啟動、主工作樹還沒有經驗檔：建在主工作樹�
   await distillNow($)
   expect(w.files.get(MAIN_NOTES) ?? '').toContain('使用者決定交接門檻維持 600k')
   expect(w.files.has(NOTES)).toBe(false)
+})
+
+for (const [name, reply] of [['空白', '   '], ['拒絕', '抱歉，我無法完成這個請求。'], ['只有標記', 'HANDOFF:']] as const) {
+  test(`handoff 內容不合格（${name}）：不 /clear、不送出，記成失敗`, async ($, on) => {
+    const w = world(on, 650_000)
+    handoffReply = reply
+    await stop($)
+    await w.clock.advance(0)
+    expect(w.forks.length).toBe(1)
+    expect(w.commands).toEqual([])
+    expect(w.submits).toEqual([])
+    const err = w.get('handoff:error:C--proj') as { reason: string }
+    expect(err.reason).toContain('內容不合格')
+  })
+}
+
+test('handoff 用 markdown 粗體開頭也算合格；內含的金鑰在送出前遮蔽', async ($, on) => {
+  const w = world(on, 650_000)
+  handoffReply = '**HANDOFF:** 修好登入\n設定在 .env，GH_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123'
+  await stop($)
+  await w.clock.advance(0)
+  expect(w.commands).toEqual(['clear'])
+  expect(w.submits[0]).toContain('修好登入')
+  expect(w.submits[0]).toContain('［已遮蔽］')
+  expect(w.submits[0]).not.toContain('ghp_')
 })
 
 test('送給整理模型的對話片段：金鑰與密碼值先遮蔽，一般文字保留', async ($, on) => {
