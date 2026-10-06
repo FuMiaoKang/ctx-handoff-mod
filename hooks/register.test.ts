@@ -93,8 +93,9 @@ const world = (on: On, tokens: number, window = 1_000_000, store: Record<string,
   on('session.cwd', () => ({ value: curCwd }))
   // 工具本身：什麼都不做，只讓 tool.call 能走到本 plugin 的 hook
   on('tool.call', () => ({ result: 'ok' }))
-  // 引擎會把路徑轉成原生格式（Windows 反斜線），比對前先統一成斜線
-  const norm = (p: string) => p.split(String.fromCharCode(92)).join('/')
+  // 引擎會把路徑轉成原生格式（Windows 反斜線），比對前先統一成斜線。
+  // macOS／Linux 把 C:/… 當成相對路徑、在前面接上目前目錄，這裡去掉前綴，讓同一組 Windows 路徑在兩邊都能跑
+  const norm = (p: string) => p.split(String.fromCharCode(92)).join('/').replace(/^\/.*?\/(?=[A-Za-z]:\/)/, '')
   on('fs.exists', (_$, e: { path: string }) => ({ value: files.has(norm(e.path)) }))
   on('fs.list', (_$, e: { path: string }) => {
     const dir = `${norm(e.path).replace(/\/+$/, '')}/`
