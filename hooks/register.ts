@@ -1,6 +1,8 @@
 import type { EngineInterface, Register, Timer } from 'claude-code'
 
 const tag = '[ctx-handoff]'
+// 指令名稱：/handoff 是使用者自己的 handoff skill，這個 mod 固定用另一個名字
+const COMMAND = 'autohandoff'
 
 // 在場 handoff：context 達 min(600k, 視窗 × 80%) 時產生 handoff → /clear → 送出
 const THRESHOLD = 600_000
@@ -397,7 +399,7 @@ let idle: Timer | undefined
 let refreshes = 0
 // 互斥：同一時間只處理一個 handoff（不攔訊息）
 let busy = false
-// 在場交接進行中（門檻或 /handoff now）：使用者訊息先攔下，交接後一併送出
+// 在場交接進行中（門檻或 /autohandoff now）：使用者訊息先攔下，交接後一併送出
 let presenting = false
 let held: string[] = []
 // 這次在場交接開始的時間（undefined＝還沒開始計時），給攔訊息的提示與等整理的上限用
@@ -407,7 +409,7 @@ const pendingNotes = new Map<string, { changes: Change[]; file: string }>()
 // 這個 process 送出失敗、尚未送達的 handoff（舊 session id）
 let myPending: { sid: string } | undefined
 let pendingToasted = false
-// 這個 process 最近產生的 handoff，/handoff resend 沒有未送達紀錄時用
+// 這個 process 最近產生的 handoff，/autohandoff resend 沒有未送達紀錄時用
 let lastHandoff: { text: string } | undefined
 let retryAfter: { turns: number; at: number } | undefined
 // classic.Stop 的最近快照；deferral 是目前延後 handoff 的原因
@@ -458,7 +460,7 @@ async function touchSeen($: EngineInterface, key: string) {
   if (seen[key] === undefined) await $.store.set('seen', { ...seen, [key]: await $.clock.now() })
 }
 
-// 失敗寫進 store 讓 /handoff 看得到；在場交接失敗還要擋一陣子才重試
+// 失敗寫進 store 讓 /autohandoff 看得到；在場交接失敗還要擋一陣子才重試
 async function recordFailure($: EngineInterface, kind: Kind, tokens: number | null, reason: string, sid?: string) {
   const at = await $.clock.now()
   const turns = await $.session.turns()
@@ -500,7 +502,7 @@ async function submitText($: EngineInterface, text: string) {
 }
 
 // /clear → 把完整文字送進新對話。送出前先存成 pendingSubmit:<舊 session id>，成功才刪；
-// 失敗時回傳階段與原因（clear 失敗＝還在舊對話，pending 已刪；submit 失敗＝pending 留著給 /handoff resend）
+// 失敗時回傳階段與原因（clear 失敗＝還在舊對話，pending 已刪；submit 失敗＝pending 留著給 /autohandoff resend）
 async function clearAndSubmit($: EngineInterface, text: string) {
   const sid = await $.session.id()
   const key = pendingKey(sid)
@@ -527,7 +529,7 @@ async function clearAndSubmit($: EngineInterface, text: string) {
 
 // ---------- 背景整理：位置與流程 ----------
 let distilling = false
-// 上一次整理有沒有失敗（有回答但沒套用也算），給 /handoff distill 判斷
+// 上一次整理有沒有失敗（有回答但沒套用也算），給 /autohandoff distill 判斷
 let distillFailed = false
 
 const slash = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -783,7 +785,7 @@ async function present($: EngineInterface, tokens: number | null, kind: 'present
     // 整理在背景跑完照樣寫檔（它不排入差異）
     const left = startedAt + DISTILL_GRACE_MS - (await $.clock.now())
     if (left > 0) await within($, lastDistill, left, undefined)
-    const why = kind === 'manual' ? '手動執行 /handoff now' : `context 達 ${tokens} tokens`
+    const why = kind === 'manual' ? '手動執行 /autohandoff now' : `context 達 ${tokens} tokens`
     const included = [...held]
     delivered = included.length
     const intro = included.length === 0
@@ -798,7 +800,7 @@ async function present($: EngineInterface, tokens: number | null, kind: 'present
       await drain(resubmit)
     } else if (failed) {
       $.ui.log(`${tag} 送出失敗：${failed.reason}`)
-      $.ui.toast(`${tag} handoff 已產生但送出失敗，/handoff resend 重送`)
+      $.ui.toast(`${tag} handoff 已產生但送出失敗，/autohandoff resend 重送`)
       await recordFailure($, kind, tokens, `送出失敗：${failed.reason}`, sid)
       // 文字建好之後才到的訊息：補進這份 pendingSubmit，重送時一起送
       let pending = text
@@ -914,16 +916,11 @@ export const register: Register = on => {
 
   on('session.start', async ($, e, next) => {
     const description = 'ctx-handoff: 狀態；now／dry／distill／resume／continue／resend／refresh on|off／distill on|off'
-    // 專案或使用者已有同名的 /handoff（例如自己的 skill）時，改用 /ctx-handoff
+    // 固定用 /autohandoff：/handoff 留給使用者自己的 handoff skill，不靠撞名時的自動退回
     try {
-      await $.command.register({ name: 'handoff', description })
+      await $.command.register({ name: COMMAND, description })
     } catch (err) {
-      try {
-        await $.command.register({ name: 'ctx-handoff', description })
-        $.ui.log(`${tag} /handoff 已被佔用（${String(err)}），改用 /ctx-handoff`)
-      } catch (err2) {
-        $.ui.log(`${tag} 指令註冊失敗：${String(err2)}`)
-      }
+      $.ui.log(`${tag} /${COMMAND} 指令註冊失敗：${String(err)}`)
     }
     try {
       await prune($)
@@ -1012,7 +1009,7 @@ export const register: Register = on => {
     }
     if (myPending && !busy && !pendingToasted) {
       pendingToasted = true
-      $.ui.toast(`${tag} 有一份 handoff 沒送達，/handoff resend 重送`)
+      $.ui.toast(`${tag} 有一份 handoff 沒送達，/autohandoff resend 重送`)
     }
     if (isSlash) return next(e)
 
@@ -1025,13 +1022,13 @@ export const register: Register = on => {
         if (!e.text.trim()) {
           return {
             drop: `${tag} 有一份離席 handoff，舊對話的快取已過期。圖片等附件無法暫存：` +
-              '請先 /handoff resume（開新對話）或 /handoff continue（留在舊對話），再重新貼上。',
+              '請先 /autohandoff resume（開新對話）或 /autohandoff continue（留在舊對話），再重新貼上。',
           }
         }
         await $.store.set(key, { ...away, held: e.text } satisfies Away)
         return {
           drop: `${tag} 有一份離席 handoff，舊對話的快取已過期。` +
-            '/handoff resume：開新對話接續，並帶上這則訊息；/handoff continue：在舊對話送出這則訊息（或直接再送一次）。' +
+            '/autohandoff resume：開新對話接續，並帶上這則訊息；/autohandoff continue：在舊對話送出這則訊息（或直接再送一次）。' +
             (hasAttachments ? '只暫存了文字，圖片等附件請在選擇後重新貼上。' : ''),
         }
       }
@@ -1047,8 +1044,8 @@ export const register: Register = on => {
     return r
   })
 
-  // 只有一個指令 /handoff（被佔用時是 /ctx-handoff），用子指令區分；不帶參數就顯示狀態和用法
-  for (const command of ['handoff', 'ctx-handoff']) on('command.run', { command }, async ($, e) => {
+  // 只有一個指令 /autohandoff，用子指令區分；不帶參數就顯示狀態和用法
+  on('command.run', { command: COMMAND }, async ($, e) => {
     const [sub = '', arg = ''] = e.args.trim().split(/\s+/)
     switch (sub) {
       case '': return { text: await status($) }
@@ -1066,15 +1063,15 @@ export const register: Register = on => {
 
 const USAGE = [
   '用法：',
-  '　/handoff                  狀態',
-  '　/handoff now              立刻產生 handoff 並 /clear',
-  '　/handoff dry              試產一份 handoff，不 /clear',
-  '　/handoff distill          立刻整理這個工作區的經驗',
-  '　/handoff resume           用離席 handoff 開新對話接續（會 /clear）',
-  '　/handoff continue         放棄離席 handoff，在舊對話送出被攔下的訊息',
-  '　/handoff resend           重新送出沒送達的 handoff（不 /clear）',
-  '　/handoff refresh on|off   開關閒置時的快取刷新',
-  '　/handoff distill on|off   開關背景整理',
+  '　/autohandoff                  狀態',
+  '　/autohandoff now              立刻產生 handoff 並 /clear',
+  '　/autohandoff dry              試產一份 handoff，不 /clear',
+  '　/autohandoff distill          立刻整理這個工作區的經驗',
+  '　/autohandoff resume           用離席 handoff 開新對話接續（會 /clear）',
+  '　/autohandoff continue         放棄離席 handoff，在舊對話送出被攔下的訊息',
+  '　/autohandoff resend           重新送出沒送達的 handoff（不 /clear）',
+  '　/autohandoff refresh on|off   開關閒置時的快取刷新',
+  '　/autohandoff distill on|off   開關背景整理',
 ].join('\n')
 
 async function status($: EngineInterface) {
@@ -1091,7 +1088,7 @@ async function status($: EngineInterface) {
     `最近一份 handoff：${last ? `${new Date(last.at).toLocaleString()} ${last.kind}，context ${last.tokens ?? '?'}` : '無'}`,
     ...(last?.usage ? [`　${describeUsage(last.usage)}`] : []),
     ...(herr && (!last || herr.at >= last.at) ? [`　最近失敗：${new Date(herr.at).toLocaleString()} ${herr.kind}，${herr.reason}`] : []),
-    ...(myPending ? ['未送達的 handoff：有（/handoff resend 重送）'] : []),
+    ...(myPending ? ['未送達的 handoff：有（/autohandoff resend 重送）'] : []),
     ...(deferral ? [`handoff 延後：${deferral}`] : []),
     ...(snapshot ? [`背景（上次 Stop）：工作 ${snapshot.tasks}、一次性排程 ${snapshot.oneShot}、循環排程 ${snapshot.recurring}`] : []),
     await distillStatus($),
@@ -1132,7 +1129,7 @@ async function distillCommand($: EngineInterface, arg: string) {
     await $.store.set('distill', arg === 'on')
     return { text: `${tag} 背景整理已設為 ${arg}` }
   }
-  if (arg !== '') return { text: `${tag} 用法 /handoff distill（立刻整理）或 /handoff distill on|off` }
+  if (arg !== '') return { text: `${tag} 用法 /autohandoff distill（立刻整理）或 /autohandoff distill on|off` }
   if (distilling) return { text: `${tag} 正在整理中` }
   const r = await distill($, '手動')
   if (r === undefined || !r.isAnswered || distillFailed) {
@@ -1142,7 +1139,7 @@ async function distillCommand($: EngineInterface, arg: string) {
 }
 
 async function refreshCommand($: EngineInterface, arg: string) {
-  if (arg !== 'on' && arg !== 'off') return { text: `${tag} 目前 ${(await isRefreshOn($)) ? 'on' : 'off'}；用法 /handoff refresh on|off` }
+  if (arg !== 'on' && arg !== 'off') return { text: `${tag} 目前 ${(await isRefreshOn($)) ? 'on' : 'off'}；用法 /autohandoff refresh on|off` }
   await $.store.set('refresh', arg === 'on')
   return { text: `${tag} 快取刷新已設為 ${arg}${arg === 'off' ? '（閒置 55 分鐘就直接產生離席 handoff）' : ''}` }
 }
@@ -1166,10 +1163,10 @@ ${handoff}`)
         if (!failed) return
         $.ui.log(`${tag} /clear 或送出失敗：${failed.reason}`)
         await recordFailure($, 'away', null, `${failed.stage} 失敗：${failed.reason}`, sid)
-        // 還在舊對話：放回離席 handoff（連同攔下的訊息），可以再 /handoff resume 或 continue
+        // 還在舊對話：放回離席 handoff（連同攔下的訊息），可以再 /autohandoff resume 或 continue
         if (failed.stage === 'clear') {
           await $.store.set(key, away)
-          $.ui.toast(`${tag} /clear 失敗，離席 handoff 已保留，可以再 /handoff resume`)
+          $.ui.toast(`${tag} /clear 失敗，離席 handoff 已保留，可以再 /autohandoff resume`)
         }
       })
       .catch(err => $.ui.log(`${tag} /clear 或送出失敗：${String(err)}`))

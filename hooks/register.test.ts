@@ -171,7 +171,7 @@ const DAY = 24 * 60 * 60_000
 const presentation = { isFullscreen: false, columns: 80 }
 const composer = { kind: 'composer' as const }
 const cmd = ($: Engine, args: string) =>
-  $.command.run({ command: 'handoff', args, origin: composer, presentation })
+  $.command.run({ command: 'autohandoff', args, origin: composer, presentation })
 const resume = ($: Engine) => cmd($, 'resume')
 const say = ($: Engine, text: string) => $.prompt.submit({ text, origin: composer, wait: false })
 const startSession = ($: Engine) => $.session.start({ cwd: 'C:/proj', surface: null, isInteractive: true })
@@ -219,7 +219,7 @@ test('門檻以下閒置：刷新 3 次後存離席 handoff，不 /clear', async
   // 之後不再排計時器
   await w.clock.advance(5 * 60 * 60_000)
   expect(w.forks.length).toBe(4)
-  // 存下的離席 handoff 能用 /handoff resume 取回
+  // 存下的離席 handoff 能用 /autohandoff resume 取回
   await resume($)
   await w.clock.advance(0)
   expect(w.commands).toEqual(['clear'])
@@ -278,8 +278,8 @@ test('handoff：不帶參數顯示狀態和用法，不認得的子指令只回�
   const w = world(on, 650_000)
   const s = await cmd($, '')
   expect(s.text).toContain('門檻')
-  expect(s.text).toContain('/handoff now')
-  expect(s.text).toContain('/handoff resend')
+  expect(s.text).toContain('/autohandoff now')
+  expect(s.text).toContain('/autohandoff resend')
   const u = await cmd($, 'nwo')
   expect(u.text).toContain('不認得「nwo」')
   expect(w.forks.length).toBe(0)
@@ -440,7 +440,7 @@ test('錨點：記下使用者最後一則訊息，下次整理從它之後開�
   let n = 5
   const w = world(on, 100_000, 1_000_000, {}, [], () => n)
   await $.prompt.submit({ text: '請幫我  整理\n這段對話', origin: composer, wait: false })
-  await $.prompt.submit({ text: '/handoff', origin: composer, wait: false })
+  await $.prompt.submit({ text: '/autohandoff', origin: composer, wait: false })
   await distillNow($)
   expect(w.forks[0]).toContain('範圍：整段對話')
   n = 9
@@ -475,7 +475,7 @@ test('S1 /clear 完成後、送出前到的訊息：另外接在 handoff 之後�
   expect(w.submits[1]).toBe('晚到的訊息')
 })
 
-test('S1 /handoff dry 進行中：人類訊息不被攔下', async ($, on) => {
+test('S1 /autohandoff dry 進行中：人類訊息不被攔下', async ($, on) => {
   const w = world(on, 100_000)
   let release: () => void = () => {}
   const gate = new Promise<void>(r => { release = r })
@@ -538,8 +538,8 @@ test('S2 被攔下的訊息與斜線指令不消耗排入的差異，下一則�
   await say($, '被攔下的訊息')
   expect(w.submits).toEqual([])
   // 斜線指令：不帶入
-  await say($, '/handoff')
-  expect(w.submits).toEqual(['/handoff'])
+  await say($, '/autohandoff')
+  expect(w.submits).toEqual(['/autohandoff'])
   expect(w.contexts[0]).toBeUndefined()
   // 再送一次＝繼續舊對話：真正進入對話，帶入差異
   await say($, '被攔下的訊息')
@@ -595,14 +595,14 @@ test('S5 狀態只顯示目前專案的資訊', async ($, on) => {
   expect(s).not.toContain('別的專案')
 })
 
-test('使用者已有 /handoff：改註冊 /ctx-handoff，指令照常可用，啟動時的整理照跑', async ($, on) => {
+test('使用者已有 /handoff skill：固定註冊 /autohandoff，指令照常可用，啟動時的整理照跑', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, { 'last:OLD': 'x' })
   takenCommands = new Set(['handoff'])
   await startSession($)
-  expect(registered).toEqual(['handoff', 'ctx-handoff'])
+  expect(registered).toEqual(['autohandoff'])
   // 啟動時的 store 清理照跑：每 session 的鍵記進 seen
   expect((w.get('seen') as Record<string, number>)['last:OLD']).toBeDefined()
-  const r = await $.command.run({ command: 'ctx-handoff', args: '', origin: composer, presentation })
+  const r = await $.command.run({ command: 'autohandoff', args: '', origin: composer, presentation })
   expect(r.text).toContain('背景整理')
 })
 
@@ -693,7 +693,7 @@ test('S6 兩個 session 各寫自己的 pendingSubmit：第二個成功只刪自
   expect(typeof (w.get('pendingSubmit:S1'))).toBe('string')
 })
 
-test('S6 攔下訊息＋/clear 成功＋送出失敗：/handoff resend 送出 handoff 與訊息，刪掉 pending', async ($, on) => {
+test('S6 攔下訊息＋/clear 成功＋送出失敗：/autohandoff resend 送出 handoff 與訊息，刪掉 pending', async ($, on) => {
   const w = world(on, 650_000, 1_000_000, {}, [], 5)
   failSubmits = 1
   onFork = async () => { await say($, '中途訊息') }
@@ -1137,7 +1137,7 @@ test('Bash cd 進別的 repo：P1 與 store 的專案鍵仍是 session 啟動資
   expect(w.get('distill:last:D--repos-alpha')).toBeUndefined()
 })
 
-test('/handoff resume 時 /clear 失敗：離席 handoff 與攔下的訊息放回去，可以再選', async ($, on) => {
+test('/autohandoff resume 時 /clear 失敗：離席 handoff 與攔下的訊息放回去，可以再選', async ($, on) => {
   const w = world(on, 100_000, 1_000_000, { 'away:S1': { handoff: 'H', held: '回來的訊息' } })
   onClear = () => { throw new Error('clear boom') }
   await cmd($, 'resume')

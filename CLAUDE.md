@@ -25,8 +25,8 @@ node tools/status.mjs             # 確認各 session 已熱重載、看整理�
 - **不自動送訊息通知 AI**：會多一次整段 context 的請求，離席時也會讓離席 handoff 被當成過時刪掉。整理有變動只跳 toast（寫完整路徑），差異用 `prompt.submit` 的 `context` 跟著下一則人類訊息帶入；不用 `session.append`（會插進進行中的回合）。
 - **一個工作區一份經驗檔，不跨專案**：工作區是 session 啟動的資料夾（依 `$.session.root()`；`$.session.repo()` 會跟著 Bash `cd` 變），從 git worktree 啟動時算主工作樹。經驗檔在 `<claude>/projects/<編碼後的工作區路徑>/memory/ctx-handoff.md`，整理只寫它、新對話只帶入它；不追蹤 session 碰過的其他 repo，也不做跨檔搬移（維護者 2026-10-05 決定：多專案分檔造成分錯專案、worktree 對應、多個 session 互改別人檔案等問題）。不寫 `MEMORY.md`（內建 auto memory 開啟時會重複載入或改寫）。
 - **不留相容舊格式的程式**：格式或機制改了就直接改，不寫遷移或雙格式判斷；舊資料用 `tools/notes.mjs` 一次手動整理。
-- **背景失敗原因寫進 `$.store`** 並在 `/handoff` 狀態顯示：`$.ui.log` 在 `/clear` 之後不會留在對話檔。手動指令沒有回答時不要回報「完成」。
-- **指令名稱**：`/handoff` 被使用者自己的指令或 skill 佔用時，改註冊 `/ctx-handoff`。
+- **背景失敗原因寫進 `$.store`** 並在 `/autohandoff` 狀態顯示：`$.ui.log` 在 `/clear` 之後不會留在對話檔。手動指令沒有回答時不要回報「完成」。
+- **指令名稱**：固定註冊 `/autohandoff`（常數 `COMMAND`）。`/handoff` 留給使用者自己的 handoff skill，不做撞名時的自動退回。
 
 ## 平台事實（實測過）
 
